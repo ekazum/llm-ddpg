@@ -1,0 +1,86 @@
+"""
+Snakefile — llm-ddpg prompt pipeline (Phase 1) on rl-llm and ai-pipeline stages.
+
+extract (per source) → filter (per source) → split_dev → verify_prompts → merge_stats
+
+Run from the repo root on this node's CPUs; every rule calls one command line.
+Paths come from config/pipeline.yaml.
+
+    snakemake --snakefile pipeline/Snakefile --cores 4 prompts
+"""
+import re
+
+# The YAML every project stage module reads; a --configfile on the command line replaces it.
+PIPELINE_CONFIG = str(workflow.configfiles[0]) if workflow.configfiles else "config/pipeline.yaml"
+configfile: "config/pipeline.yaml"
+
+DATA = config["DATA_DIR"]
+RAW, FILTERED = f"{DATA}/raw", f"{DATA}/filtered"
+PROMPTS, STATS = f"{DATA}/prompts", f"{DATA}/stats"
+
+SOURCES = list(config["SOURCES"])
+TRAIN_SOURCE = config["TRAIN_SOURCE"]
+TEST_SOURCE = config["TEST_SOURCE"]
+PROMPTS_CONFIG = config["PROMPTS_CONFIG"]
+
+# The tokenizer is read from the cache; no job reaches the network.
+shell.prefix(f"export HF_HOME={config['HF_HOME']} HF_HUB_OFFLINE=1; ")
+
+wildcard_constraints:
+    source = "|".join(re.escape(s) for s in SOURCES),
+
+PROMPT_FILES = [f"{PROMPTS}/prompts_{split}.parquet" for split in ("train", "dev", "test")]
+
+
+rule prompts:
+    input:
+        f"{STATS}/pipeline_stats.json",
+
+
+rule extract:
+    input:
+        lambda wc: config["SOURCES"][wc.source],
+    output:
+        f"{RAW}/{{source}}.parquet",
+    shell:
+        "python pipeline/extract_prompts.py --config {PIPELINE_CONFIG} --source {wildcards.source} "
+        "--input {input} --output {output}"
+
+
+rule filter:
+    input:
+        f"{RAW}/{{source}}.parquet",
+    output:
+        f"{FILTERED}/{{source}}.parquet",
+    shell:
+        "python -m rl_llm.filter_prompts --config {PROMPTS_CONFIG} "
+        "--input {input} --output {output} --stats-dir {STATS}"
+
+
+rule split_dev:
+    input:
+        train = f"{FILTERED}/{TRAIN_SOURCE}.parquet",
+        test = f"{FILTERED}/{TEST_SOURCE}.parquet",
+    output:
+        PROMPT_FILES,
+    shell:
+        "python -m rl_llm.split_dev --config {PROMPTS_CONFIG} "
+        "--input {input.train} {input.test} --output {output} --stats-dir {STATS}"
+
+
+rule verify_prompts:
+    input:
+        PROMPT_FILES,
+    output:
+        f"{STATS}/verify_prompts.json",
+    shell:
+        "python -m rl_llm.verify_prompts --config {PROMPTS_CONFIG} --input {input} --output {output}"
+
+
+rule merge_stats:
+    input:
+        f"{STATS}/verify_prompts.json",
+    output:
+        f"{STATS}/pipeline_stats.json",
+    shell:
+        "python pipeline/merge_stats.py --config {PIPELINE_CONFIG} --input {input} --output {output}"

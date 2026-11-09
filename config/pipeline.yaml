@@ -1,0 +1,23 @@
+# Prompt pipeline workflow settings, read by pipeline/Snakefile and by the
+# project's stage modules through PipelineConfig. Paths are relative to the
+# repo root; `data` is a symlink to the lab share made by
+# scripts/download_inputs.sh.
+
+# Every pipeline output goes under this directory.
+DATA_DIR: data/pipeline
+
+# Raw parquet files by source name, as downloaded by scripts/download_inputs.sh.
+SOURCES:
+  train_prefs: data/raw/ultrafeedback_binarized/data/train_prefs-00000-of-00001.parquet
+  test_prefs: data/raw/ultrafeedback_binarized/data/test_prefs-00000-of-00001.parquet
+
+# The source split into train and dev, and the source that is the test split.
+TRAIN_SOURCE: train_prefs
+TEST_SOURCE: test_prefs
+
+# PromptPipelineConfig YAML for rl_llm's filter, split and verify stages.
+PROMPTS_CONFIG: config/prompts.yaml
+
+# Hugging Face cache holding the tokenizer (and later the models); every job
+# runs offline against it.
+HF_HOME: /private/shaham-lab/ekazum/hf_cache
