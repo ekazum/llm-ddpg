@@ -1,4 +1,4 @@
-# Settings of rl_llm's prompt pipeline stages (PromptPipelineConfig):
+# Settings of the prompt pipeline stages (PromptPipelineConfig):
 # FilterPrompts, SplitDev and VerifyPrompts.
 
 # Policy tokenizer; a prompt's length is measured after its chat template.

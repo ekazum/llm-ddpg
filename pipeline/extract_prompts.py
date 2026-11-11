@@ -12,10 +12,10 @@ from typing import Optional, Sequence
 
 import pandas as pd
 from ai_pipeline import ExtractStage
-from rl_llm import PromptSchema
 
 from cli import parse
 from pipeline_config import PipelineConfig
+from prompt_schema import PromptSchema
 
 logger = logging.getLogger(__name__)
 

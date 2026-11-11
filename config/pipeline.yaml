@@ -15,7 +15,7 @@ SOURCES:
 TRAIN_SOURCE: train_prefs
 TEST_SOURCE: test_prefs
 
-# PromptPipelineConfig YAML for rl_llm's filter, split and verify stages.
+# PromptPipelineConfig YAML for the filter, split and verify stages.
 PROMPTS_CONFIG: config/prompts.yaml
 
 # Hugging Face cache holding the tokenizer (and later the models); every job

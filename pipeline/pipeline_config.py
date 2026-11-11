@@ -16,7 +16,7 @@ class PipelineConfig(YamlConfig):
     # The source split into train and dev, and the source that is the test split.
     TRAIN_SOURCE: str
     TEST_SOURCE: str
-    # PromptPipelineConfig YAML for rl_llm's filter, split and verify stages.
+    # PromptPipelineConfig YAML for the filter, split and verify stages.
     PROMPTS_CONFIG: str
     # Hugging Face cache holding the tokenizer; jobs run offline against it.
     HF_HOME: str

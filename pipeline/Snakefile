@@ -1,5 +1,5 @@
 """
-Snakefile — llm-ddpg prompt pipeline (Phase 1) on rl-llm and ai-pipeline stages.
+Snakefile — llm-ddpg prompt pipeline (Phase 1) on ai-pipeline stages.
 
 extract (per source) → filter (per source) → split_dev → verify_prompts → merge_stats
 
@@ -53,7 +53,7 @@ rule filter:
     output:
         f"{FILTERED}/{{source}}.parquet",
     shell:
-        "python -m rl_llm.filter_prompts --config {PROMPTS_CONFIG} "
+        "python pipeline/filter_prompts.py --config {PROMPTS_CONFIG} "
         "--input {input} --output {output} --stats-dir {STATS}"
 
 
@@ -64,7 +64,7 @@ rule split_dev:
     output:
         PROMPT_FILES,
     shell:
-        "python -m rl_llm.split_dev --config {PROMPTS_CONFIG} "
+        "python pipeline/split_dev.py --config {PROMPTS_CONFIG} "
         "--input {input.train} {input.test} --output {output} --stats-dir {STATS}"
 
 
@@ -74,7 +74,7 @@ rule verify_prompts:
     output:
         f"{STATS}/verify_prompts.json",
     shell:
-        "python -m rl_llm.verify_prompts --config {PROMPTS_CONFIG} --input {input} --output {output}"
+        "python pipeline/verify_prompts.py --config {PROMPTS_CONFIG} --input {input} --output {output}"
 
 
 rule merge_stats:

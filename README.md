@@ -1,34 +1,42 @@
 # llm-ddpg
 
-Off-policy RL fine-tuning of a chat language model on [rl-llm](https://github.com/ekazum/rl-llm): policy
-`Qwen/Qwen3-1.7B`, reward model `Skywork/Skywork-Reward-V2-Qwen3-1.7B` (frozen first, trained in a later phase),
-prompts from `HuggingFaceH4/ultrafeedback_binarized`. This repo holds what is specific to the project: the extract
-stage for its dataset, the config files, the Snakemake workflow and the launchers. The generic stages and, later, the
-trainer threads live in rl-llm.
+Off-policy RL fine-tuning of a chat language model: policy `Qwen/Qwen3-1.7B`, reward model
+`Skywork/Skywork-Reward-V2-Qwen3-1.7B` (one frozen copy gives the reward; a second copy, trained, is the critic),
+prompts from `HuggingFaceH4/ultrafeedback_binarized`. The parts that are not specific to language models come from
+[rl-core](https://github.com/ekazum/rl-core), [ai-runtime](https://github.com/ekazum/ai-runtime) and
+[ai-pipeline](https://github.com/ekazum/ai-pipeline); this repo holds everything else: the prompt pipeline, the config
+files, the launchers and, phase by phase, the evaluation and training classes. `docs/ARCHITECTURE.md`
+describes the design and the phases.
 
 Phase 1 is the prompt pipeline: the two UltraFeedback preference files become `prompts_train.parquet`,
-`prompts_dev.parquet` and `prompts_test.parquet` with one schema, plus a stats JSON per stage. It runs on the CPUs
-of the current node; the GPU phases that follow run as SLURM jobs.
+`prompts_dev.parquet` and `prompts_test.parquet` with one schema, plus a stats JSON per stage. It runs on the CPUs of
+the current node; the GPU phases that follow run as SLURM jobs.
 
-| File                                             | Role                                                                                                   |
-|--------------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `pipeline/Snakefile`                             | extract → filter → split_dev → verify_prompts → merge_stats; one command line per rule                 |
-| `pipeline/extract_prompts.py`                    | `ExtractPrompts`: one ultrafeedback_binarized source to the prompts extract columns                    |
-| `pipeline/merge_stats.py`                        | `MergeStats`: every stage's stats JSON into `pipeline_stats.json`                                      |
-| `pipeline/pipeline_config.py`, `pipeline/cli.py` | `PipelineConfig` for `config/pipeline.yaml` and the shared command line                                |
-| `config/pipeline.yaml`                           | data directory, raw sources, which source is train and which is test, HF cache                         |
-| `config/prompts.yaml`                            | rl-llm's `PromptPipelineConfig`: tokenizer, length limit, dev size, row minimums                       |
-| `scripts/download_inputs.sh`                     | one-time download of the two parquet files and the tokenizer; links `data` to the lab share            |
-| `scripts/run_prompts.sh`                         | runs the prompt pipeline on local cores; `--dry-run` prints the plan, `--cores N` sets the parallelism |
+| File                                             | Role                                                                                                    |
+|--------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| `pipeline/Snakefile`                             | extract → filter → split_dev → verify_prompts → merge_stats; one command line per rule                  |
+| `pipeline/extract_prompts.py`                    | `ExtractPrompts`: one ultrafeedback_binarized source to the prompts extract columns                     |
+| `pipeline/filter_prompts.py`                     | `FilterPrompts`: drops empty, duplicate and over-long prompts; adds `prompt_tokens`                     |
+| `pipeline/split_dev.py`                          | `SplitDev`: train and dev by a seeded hash of the key, test passed through, one file per split          |
+| `pipeline/verify_prompts.py`                     | `VerifyPrompts`: schema, unique keys, no dev or test prompt in train; its stats JSON is the pass signal |
+| `pipeline/merge_stats.py`                        | `MergeStats`: every stage's stats JSON into `pipeline_stats.json`                                       |
+| `pipeline/prompt_schema.py`                      | `PromptSchema`: the columns of a prompts parquet and the file name per split                            |
+| `pipeline/prompt_pipeline_config.py`             | `PromptPipelineConfig` for `config/prompts.yaml`                                                        |
+| `pipeline/pipeline_config.py`, `pipeline/cli.py` | `PipelineConfig` for `config/pipeline.yaml` and the shared command line                                 |
+| `config/pipeline.yaml`                           | data directory, raw sources, which source is train and which is test, HF cache                          |
+| `config/prompts.yaml`                            | `PromptPipelineConfig`: tokenizer, length limit, dev size, row minimums                                 |
+| `scripts/download_inputs.sh`                     | one-time download of the two parquet files and the tokenizer; links `data` to the lab share             |
+| `scripts/run_prompts.sh`                         | runs the prompt pipeline on local cores; `--dry-run` prints the plan, `--cores N` sets the parallelism  |
 
 ## Setup
 
-One environment on the lab share, with rl-llm installed from its clone:
+One environment on the lab share:
 
 ```bash
 conda create -p /private/shaham-lab/ekazum/envs/llm-ddpg python=3.12 -y
 conda activate /private/shaham-lab/ekazum/envs/llm-ddpg
-pip install -e ~/github/rl-llm snakemake
+pip install "ai-pipeline @ git+https://github.com/ekazum/ai-pipeline.git@v0.1.0" \
+    transformers pandas pyarrow numpy snakemake
 ```
 
 ## Run Phase 1
@@ -39,9 +47,9 @@ bash scripts/run_prompts.sh --dry-run # the plan
 bash scripts/run_prompts.sh           # run; --cores N for more parallelism
 ```
 
-The download links `data` in the repo root to `/private/shaham-lab/ekazum/llm-ddpg` and fills `data/raw/`; the
-tokenizer goes to the shared Hugging Face cache named in `config/pipeline.yaml`, which every stage reads offline.
-A rerun continues from the first missing output.
+The download links `data` in the repo root to `/private/shaham-lab/ekazum/llm-ddpg` and fills `data/raw/`; the tokenizer
+goes to the shared Hugging Face cache named in `config/pipeline.yaml`, which every stage reads offline. A rerun
+continues from the first missing output.
 
 ## Outputs
 
