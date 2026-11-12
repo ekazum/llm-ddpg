@@ -1,0 +1,44 @@
+# Evaluation settings (LLMEvalConfig), read by the baseline job. Paths are
+# relative to the repo root; `data` is a symlink to the lab share.
+
+# Prompts generated per batch by the policy.
+batch_size: 32
+
+# Rows scored per split; 0 scores every row. Set a few dozen for a short first run.
+limit: 0
+
+# Policy and reward model, as Hugging Face ids; both are read from the cache.
+policy_model: Qwen/Qwen3-1.7B
+reward_model: Skywork/Skywork-Reward-V2-Qwen3-1.7B
+
+# Devices the two models are loaded on.
+policy_device: cuda:0
+reward_device: cuda:0
+
+# Qwen3 template switch: no thinking block; the same as in config/prompts.yaml.
+chat_template_kwargs:
+  enable_thinking: false
+
+# Longest response, in tokens.
+max_new_tokens: 512
+
+# Sampling temperature; 0 generates greedily.
+temperature: 0.0
+
+# Longest (prompt, response) input the reward model reads, in tokens.
+reward_max_tokens: 2048
+
+# Reward model batching: pairs per sort window, idle seconds before a flush,
+# characters per batch.
+reward_window_size: 256
+reward_idle_timeout_s: 0.2
+reward_batch_chars: 64000
+
+# Pairs scored one by one and as one batch at start, and the largest score
+# difference accepted before the job stops.
+reward_batch_check_pairs: 8
+reward_batch_tolerance: 0.5
+
+# Directory of the three prompts files, and the directory run records go under.
+prompts_dir: data/pipeline/prompts
+records_dir: data/records

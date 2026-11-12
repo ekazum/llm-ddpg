@@ -51,6 +51,21 @@ The download links `data` in the repo root to `/private/shaham-lab/ekazum/llm-dd
 goes to the shared Hugging Face cache named in `config/pipeline.yaml`, which every stage reads offline. A rerun
 continues from the first missing output.
 
+## Run Phase 2
+
+Phase 2 is the baseline job: the untrained policy scored by the frozen reward model on dev and on test, after a check
+that the reward model prefers the `chosen` reply of each dev pair. It needs rl-core in the environment
+(`pip install -e ~/github/rl-core`, which also installs torch) and one GPU.
+
+```bash
+bash scripts/download_models.sh       # once, from a node with internet access
+bash scripts/submit_baseline.sh       # submits scripts/baseline_job.sh with config/eval.yaml
+```
+
+Set `limit` in `config/eval.yaml` to a few dozen for a short first run. Each run writes
+`data/records/baseline_<timestamp>/` with `eval.db`, `responses_dev.parquet`, `responses_test.parquet` and
+`meta.json`; the job log is `logs/baseline_<job id>.log`. `docs/ARCHITECTURE.md` section 10 lists the classes.
+
 ## Outputs
 
 Under `data/pipeline/`:

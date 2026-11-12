@@ -11,7 +11,8 @@
 7. [Design Principles](#7-design-principles)
 8. [Directory Structure](#8-directory-structure)
 9. [Execution](#9-execution)
-10. [Phases](#10-phases)
+10. [Baseline Evaluation](#10-baseline-evaluation)
+11. [Phases](#11-phases)
 
 ---
 
@@ -142,6 +143,7 @@ llm-ddpg/
   config/
     pipeline.yaml               PipelineConfig: data directory, sources, cache location
     prompts.yaml                PromptPipelineConfig: tokenizer, limits, dev size
+    eval.yaml                   LLMEvalConfig: models, generation, reward model batching, locations
   pipeline/
     Snakefile                   the prompt pipeline workflow
     cli.py
@@ -153,9 +155,28 @@ llm-ddpg/
     split_dev.py
     verify_prompts.py
     merge_stats.py
+  src/
+    rl_agent/
+      token_policy_model.py
+      sequence_reward_model.py
+      reward_model_worker.py
+      reward_model_client.py
+      evaluation/
+        llm_eval_config.py
+        llm_score_task.py
+        prompt_reader.py
+        response_schema.py
+        run_record.py
+    baselines/
+      untrained/
+        baseline_manager.py
+        baseline_main.py        python -m src.baselines.untrained.baseline_main
   scripts/
     download_inputs.sh          one-time download of the sources and the tokenizer
     run_prompts.sh              runs the prompt pipeline on local cores
+    download_models.sh          one-time download of the policy and the reward model
+    submit_baseline.sh          submits the baseline job
+    baseline_job.sh             the baseline job script
 ```
 
 ---
@@ -175,7 +196,56 @@ Hugging Face cache named in `config/pipeline.yaml`; every stage runs offline aga
 
 ---
 
-## 10. Phases
+## 10. Baseline Evaluation
+
+Phase 2 scores the untrained policy with the frozen reward model in one GPU job. `BaselineManager` builds the parts,
+starts the reward model thread, runs the steps below in order on the calling thread and stops the thread. All generation
+is `generate` of the transformers library on the policy module; the reward model reads a user turn and an assistant turn
+under its own chat template, with no system prompt, and returns one score per pair.
+
+| Step           | Does                                                                                                  |
+|----------------|-------------------------------------------------------------------------------------------------------|
+| Input check    | the three prompts files exist                                                                         |
+| Batching check | a few dev pairs are scored one by one and as one batch; the job stops when padding changes the scores |
+| Reward check   | `chosen` and `rejected` of every dev prompt are scored; how often `chosen` scores higher is recorded  |
+| Score dev      | one response per dev prompt from the policy, each scored; one dev row at update 0                     |
+| Score test     | the same on test; the test metrics                                                                    |
+
+| File                                          | Class                 | Role                                                                                                    |
+|-----------------------------------------------|-----------------------|---------------------------------------------------------------------------------------------------------|
+| `src/baselines/untrained/baseline_manager.py` | `BaselineManager`     | builds the parts, owns the thread stage and the order of the steps                                      |
+| `src/baselines/untrained/baseline_main.py`    | —                     | entry point: loads the config, runs the manager                                                         |
+| `src/rl_agent/token_policy_model.py`          | `TokenPolicyModel`    | the policy with its tokenizer and chat template; `generate` gives the response text and its token count |
+| `src/rl_agent/sequence_reward_model.py`       | `SequenceRewardModel` | the reward model as an ai-runtime `BatchModel`: (prompt, response) pairs in, one score each out         |
+| `src/rl_agent/reward_model_worker.py`         | `RewardModelWorker`   | the reward model thread, an ai-runtime `GpuBatchStage`: length-sorted batches under a budget            |
+| `src/rl_agent/reward_model_client.py`         | `RewardModelClient`   | the caller side: `predict(prompts, responses)` puts a request on the queue and waits for the scores     |
+| `src/rl_agent/evaluation/llm_score_task.py`   | `LLMScoreTask`        | rl-core's `ScoreTask` for this project: generate, reward, record                                        |
+| `src/rl_agent/evaluation/llm_eval_config.py`  | `LLMEvalConfig`       | rl-core's `EvalConfig` plus the models, generation settings, reward batching and locations              |
+| `src/rl_agent/evaluation/prompt_reader.py`    | `PromptReader`        | the prompts file of a split, cut to the row limit                                                       |
+| `src/rl_agent/evaluation/response_schema.py`  | `ResponseSchema`      | the columns of a responses file                                                                         |
+| `src/rl_agent/evaluation/run_record.py`       | `RunRecord`           | the run directory and its `meta.json`                                                                   |
+
+rl-core supplies the abstract `EvalTask` and `ScoreTask` that a manager is written against, the base `EvalConfig`, and
+`EvalStore`, the owner of `eval.db`. Tasks are independent: none holds another, and the manager calls each.
+
+Each run writes one directory, `<records_dir>/baseline_<timestamp>/`:
+
+| File                                              | Content                                                                                                      |
+|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `eval.db`                                         | `dev_metrics` (one row: mean reward, prompts, mean response tokens, seconds), `test_metrics`, `reward_check` |
+| `responses_dev.parquet`, `responses_test.parquet` | `prompt_id`, `response`, `reward`, `response_tokens`, `split`                                                |
+| `meta.json`                                       | run id, kind, label, creation time, status                                                                   |
+
+The job is started by its launcher; the models are downloaded once beforehand:
+
+```bash
+bash scripts/download_models.sh       # once, from a machine with network access
+bash scripts/submit_baseline.sh       # config/eval.yaml; --config PATH for another file
+```
+
+---
+
+## 11. Phases
 
 Each phase adds parts that run on their own before the next phase starts. The parts named under rl-core are added to
 that package; every other part is added here.
