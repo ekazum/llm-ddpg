@@ -1,0 +1,58 @@
+# Training job settings (TrainConfig), read by scripts/train_job.sh. Paths are
+# relative to the repo root; `data` is a symlink to the lab share.
+
+# Policy (the actor) and reward model, as Hugging Face ids; both are read from the cache.
+policy_model: Qwen/Qwen3-1.7B
+reward_model: Skywork/Skywork-Reward-V2-Qwen3-1.7B
+
+# Devices the two models are loaded on.
+policy_device: cuda:0
+reward_device: cuda:0
+
+# Qwen3 template switch: no thinking block; the same as in config/prompts.yaml.
+chat_template_kwargs:
+  enable_thinking: false
+
+# Longest response, in tokens; also the width of the replay buffer's response column.
+max_new_tokens: 512
+
+# Sampling temperature of the actor; above 0.
+temperature: 1.0
+
+# Prompts per actor batch, and the most prompts the actor GPU worker generates for at once.
+actor_batch_size: 32
+generate_batch_size: 32
+
+# Seconds the actor GPU worker waits for more prompts before it generates for what it has.
+generate_idle_timeout_s: 0.2
+
+# Longest (prompt, response) input the reward model reads, in tokens.
+reward_max_tokens: 2048
+
+# Reward model batching: pairs per sort window, idle seconds before a flush,
+# characters per batch.
+reward_window_size: 256
+reward_idle_timeout_s: 0.2
+reward_batch_chars: 64000
+
+# Replay buffer rows (1 to any), priority exponent (0 = uniform, up to 1),
+# first importance weight exponent (0 to 1), draws over which it rises to 1,
+# and the floor added to each TD error (above 0).
+replay_capacity: 100000
+per_alpha: 0.6
+per_beta_start: 0.4
+per_n_anneal: 100000
+per_priority_floor: 0.01
+
+# Transitions the actor writes before the job stops. A short first run.
+max_actor_transitions: 2048
+
+# Transitions written per learner update at most; 0 turns the limit off.
+push_per_update_ratio: 0
+
+# Seed of the prompt order and of the replay draws.
+seed: 0
+
+# Directory of the three prompts files, and the directory run records go under.
+prompts_dir: data/pipeline/prompts
+records_dir: data/records

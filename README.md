@@ -55,7 +55,7 @@ continues from the first missing output.
 
 Phase 2 is the baseline job: the untrained policy scored by the frozen reward model on dev and on test, after a check
 that the reward model prefers the `chosen` reply of each dev pair. It needs rl-core in the environment
-(`pip install -e ~/github/rl-core`, which also installs torch) and one GPU.
+(`pip install "rl-core @ git+https://github.com/ekazum/rl-core.git@v0.7.0"`, which also installs torch) and one GPU.
 
 ```bash
 bash scripts/download_models.sh       # once, from a node with internet access
@@ -65,6 +65,20 @@ bash scripts/submit_baseline.sh       # submits scripts/baseline_job.sh with con
 Set `limit` in `config/eval.yaml` to a few dozen for a short first run. Each run writes
 `data/records/baseline_<timestamp>/` with `eval.db`, `responses_dev.parquet`, `responses_test.parquet` and
 `meta.json`; the job log is `logs/baseline_<job id>.log`. `docs/ARCHITECTURE.md` section 10 lists the classes.
+
+## Run Phase 3
+
+Phase 3 is the training job's sampling and reward loop, with no learning yet: train prompts in a seeded order per pass,
+one sampled response per prompt, its frozen reward model score, and one replay buffer row per (prompt, response). The
+job stops once `max_actor_transitions` rows are stored.
+
+```bash
+bash scripts/submit_train.sh          # submits scripts/train_job.sh with config/train.yaml
+```
+
+Each run writes `data/records/train_<timestamp>/` with `stats.db` (`actor_batches`: one row per actor batch with
+mean reward, response tokens, the share of responses cut at `max_new_tokens`, generate and reward seconds; `buffer`;
+`counters`) and `meta.json`; the job log is `logs/train_<job id>.log`.
 
 ## Outputs
 

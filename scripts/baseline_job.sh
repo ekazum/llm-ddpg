@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=llm-ddpg-baseline
-#SBATCH --partition=p_uriofir
-#SBATCH --account=ug_uri_ofir
+#SBATCH --partition=shaham-L40
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
 #SBATCH --output=logs/baseline_%j.log
 set -euo pipefail
 # Phase 2 job: the untrained policy scored on dev and on test. Submitted by

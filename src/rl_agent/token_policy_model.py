@@ -25,8 +25,28 @@ class TokenPolicyModel:
         self._model.eval()
         logger.info("TokenPolicyModel: %s on %s", model_name, self._device)
 
+    @property
+    def pad_token_id(self) -> int:
+        """The id that pads a response after its end."""
+        return int(self._tokenizer.pad_token_id)
+
     def generate(self, prompts: list[str], max_new_tokens: int, temperature: float) -> list[tuple[str, int]]:
         """One ``(response text, response tokens)`` per prompt; greedy when ``temperature`` is 0."""
+        new_tokens = self._new_tokens(prompts, max_new_tokens, temperature)
+        counts: list[int] = (new_tokens != self.pad_token_id).sum(dim=1).tolist()
+        responses: list[str] = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+        return [(text.strip(), int(count)) for text, count in zip(responses, counts)]
+
+    def sample(self, prompts: list[str], max_new_tokens: int, temperature: float) -> list[tuple[list[int], str]]:
+        """One ``(response token ids, response text)`` per prompt; the ids stop at the first padding id."""
+        new_tokens = self._new_tokens(prompts, max_new_tokens, temperature).cpu()
+        counts: list[int] = (new_tokens != self.pad_token_id).sum(dim=1).tolist()
+        ids: list[list[int]] = [row[:count].tolist() for row, count in zip(new_tokens, counts)]
+        texts: list[str] = self._tokenizer.batch_decode(ids, skip_special_tokens=True)
+        return [(row_ids, text.strip()) for row_ids, text in zip(ids, texts)]
+
+    def _new_tokens(self, prompts: list[str], max_new_tokens: int, temperature: float) -> torch.Tensor:
+        """The generated tokens of each prompt under the chat template, padded on the right."""
         texts: list[str] = [
             str(self._tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
@@ -38,15 +58,11 @@ class TokenPolicyModel:
         ]
         encoded = self._tokenizer(texts, return_tensors="pt", padding=True, add_special_tokens=False)
         encoded = encoded.to(self._device)
-        pad_id = self._tokenizer.pad_token_id
         sampling: dict[str, Any] = (
             {"do_sample": True, "temperature": temperature} if temperature > 0 else {"do_sample": False}
         )
         with torch.no_grad():
             # generate comes from GenerationMixin, which the PreTrainedModel stub does not carry.
             output: torch.Tensor = cast(Any, self._model).generate(
-                **encoded, max_new_tokens=max_new_tokens, pad_token_id=pad_id, **sampling)
-        new_tokens = output[:, encoded["input_ids"].shape[1]:]
-        counts: list[int] = (new_tokens != pad_id).sum(dim=1).tolist()
-        responses: list[str] = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-        return [(text.strip(), int(count)) for text, count in zip(responses, counts)]
+                **encoded, max_new_tokens=max_new_tokens, pad_token_id=self.pad_token_id, **sampling)
+        return output[:, encoded["input_ids"].shape[1]:]
