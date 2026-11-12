@@ -44,6 +44,23 @@ per_beta_start: 0.4
 per_n_anneal: 100000
 per_priority_floor: 0.01
 
+# Device the learner trains on.
+learner_device: cuda:0
+
+# Rows per learner batch (1 or more), and rows stored before the first draw
+# (at least the batch size is used).
+learner_batch_size: 32
+min_buffer_size: 512
+
+# Batches drawn per hold of the buffer lock, drawn batches queued ahead, and
+# pinned slots in the pool (each 1 or more).
+block_batches: 4
+prefetch_depth: 8
+pinned_slots: 8
+
+# Learner updates between two buffer stats rows (1 or more).
+stats_every_updates: 100
+
 # Transitions the actor writes before the job stops. A short first run.
 max_actor_transitions: 2048
 

@@ -1,8 +1,10 @@
 """``RLManager`` — the training job: builds every part and queue, runs the threads, stops them in order.
 
-Phase 3 runs the sampling and reward loop only: ``ActorFeeder`` -> ``ActorProcessor`` (responses from
-``ActorGPUWorker``, rewards from ``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``.
-The job stops once ``max_actor_transitions`` are stored. The reward model thread has its own stage, stopped last.
+Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWorker``, rewards from
+``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
+``LearnerProcessor`` -> ``LearnerGPUWorker`` (Phase 4: no gradient step yet); ``StatsProcessor`` writes the buffer
+stats rows. The job stops once ``max_actor_transitions`` are stored. The reward model thread has its own stage,
+stopped last.
 """
 
 import logging
@@ -11,19 +13,26 @@ import threading
 from typing import Optional
 
 import numpy as np
+import torch
 from ai_runtime import ThreadStages
 from rl_core.actor_feeder import ActorFeeder
 from rl_core.prioritized_replay_buffer import PrioritizedReplayBuffer
+from rl_core.replay_reader import ReplayReader
 from rl_core.replay_writer import ReplayWriter
+from rl_core.stats_processor import StatsProcessor
 
 from src.rl_agent.agent.actor_gpu_worker import ActorGPUWorker
 from src.rl_agent.agent.actor_processor import ActorProcessor
+from src.rl_agent.agent.learner_gpu_worker import LearnerGPUWorker
+from src.rl_agent.agent.learner_processor import LearnerProcessor
+from src.rl_agent.agent.pinned_slot import PinnedSlot
 from src.rl_agent.agent.prompt_sampler import PromptSampler
 from src.rl_agent.agent.sampling_model import SamplingModel
 from src.rl_agent.agent.trajectory_codec import TrajectoryCodec
 from src.rl_agent.evaluation.prompt_reader import PromptReader
 from src.rl_agent.evaluation.run_record import RunRecord
 from src.rl_agent.reward_model_client import RewardModelClient
+from src.rl_agent.reward_model_tokenizer import RewardModelTokenizer
 from src.rl_agent.reward_model_worker import RewardModelWorker
 from src.rl_agent.sequence_reward_model import SequenceRewardModel
 from src.rl_agent.telemetry.stats_store import StatsStore
@@ -43,11 +52,17 @@ class RLManager:
     _PROCESSOR_STAGE = "actor-processor"
     _ACTOR_GPU_STAGE = "actor-gpu-worker"
     _WRITER_STAGE = "replay-writer"
+    _READER_STAGE = "replay-reader"
+    _LEARNER_PROCESSOR_STAGE = "learner-processor"
+    _LEARNER_STAGE = "learner"
+    _STATS_STAGE = "stats-processor"
     # Producers are joined before their consumers.
-    _JOIN_ORDER = [_FEEDER_STAGE, _PROCESSOR_STAGE, _ACTOR_GPU_STAGE, _WRITER_STAGE]
-    # Actor batches waiting for a processor, and pushed batches waiting for the writer.
+    _JOIN_ORDER = [_FEEDER_STAGE, _PROCESSOR_STAGE, _ACTOR_GPU_STAGE, _READER_STAGE, _LEARNER_PROCESSOR_STAGE,
+                   _LEARNER_STAGE, _WRITER_STAGE, _STATS_STAGE]
+    # Actor batches waiting for a processor, pushed batches waiting for the writer, and stats events.
     _BATCH_QUEUE_SIZE = 4
     _WRITE_QUEUE_SIZE = 8
+    _STATS_QUEUE_SIZE = 2048
     # Seconds between checks of the stop condition and of the reward model's readiness.
     _POLL_S = 5.0
 
@@ -56,6 +71,7 @@ class RLManager:
         config: TrainConfig,
         policy: Optional[TokenPolicyModel] = None,
         reward_model: Optional[SequenceRewardModel] = None,
+        critic_tokenizer: Optional[RewardModelTokenizer] = None,
     ) -> None:
         """Check the inputs, load both models, open the run record, build the parts and wire the stages."""
         self._config = config
@@ -75,11 +91,17 @@ class RLManager:
             name=self._RM_STAGE,
         )
         policy = policy or TokenPolicyModel(config.policy_model, config.policy_device, config.chat_template_kwargs)
+        # Its own instance: a tokenizer must not be called from two threads at once.
+        critic_tokenizer = critic_tokenizer or RewardModelTokenizer(config.reward_model, config.reward_max_tokens)
 
         self._shutdown_event = threading.Event()
         batch_queue: queue.Queue = queue.Queue(maxsize=self._BATCH_QUEUE_SIZE)
         sample_queue: queue.Queue = queue.Queue()
         write_queue: queue.Queue = queue.Queue(maxsize=self._WRITE_QUEUE_SIZE)
+        stats_queue: queue.Queue = queue.Queue(maxsize=self._STATS_QUEUE_SIZE)
+        prefetch_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
+        tensor_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
+        slot_pool = self._slot_pool(config)
         actor_worker = ActorGPUWorker(
             SamplingModel(policy, config.max_new_tokens, config.temperature),
             sample_queue,
@@ -101,6 +123,7 @@ class RLManager:
             config.per_n_anneal,
             config.per_priority_floor,
             replay_seed,
+            stats_q=stats_queue,
         )
         writer = ReplayWriter(self._buffer, write_queue, self._telemetry, self._shutdown_event)
         processor = ActorProcessor(
@@ -123,16 +146,57 @@ class RLManager:
             config.push_per_update_ratio,
             self._shutdown_event,
         )
+        reader = ReplayReader(
+            self._buffer,
+            prefetch_queue,
+            config.learner_batch_size,
+            config.min_buffer_size,
+            config.block_batches,
+            self._shutdown_event,
+        )
+        learner_processor = LearnerProcessor(
+            self._buffer,
+            self._sampler,
+            policy,
+            critic_tokenizer,
+            prefetch_queue,
+            tensor_queue,
+            slot_pool,
+            self._shutdown_event,
+        )
+        learner = LearnerGPUWorker(
+            tensor_queue,
+            slot_pool,
+            stats_queue,
+            self._telemetry,
+            config.learner_device,
+            config.stats_every_updates,
+            self._shutdown_event,
+        )
+        stats = StatsProcessor(stats_queue, self._buffer, self._telemetry, config.replay_capacity, self._shutdown_event)
 
         self._rm_stages = ThreadStages("RLManager.rm", self._rm_shutdown_event)
         self._rm_stages.stage(self._RM_STAGE, self._rm_worker.run)
         # Stages start in the order added: services before producers.
         self._stages = ThreadStages("RLManager", self._shutdown_event)
+        self._stages.stage(self._STATS_STAGE, stats.run, inbox=stats_queue, sentinel_after=self._LEARNER_STAGE)
         self._stages.stage(self._ACTOR_GPU_STAGE, actor_worker.run)
         self._stages.stage(self._WRITER_STAGE, writer.run, inbox=write_queue)
         self._stages.stage(self._PROCESSOR_STAGE, processor.run, inbox=batch_queue)
         self._stages.stage(self._FEEDER_STAGE, feeder.run)
+        self._stages.stage(self._READER_STAGE, reader.run)
+        self._stages.stage(self._LEARNER_PROCESSOR_STAGE, learner_processor.run, inbox=prefetch_queue)
+        self._stages.stage(self._LEARNER_STAGE, learner.run, inbox=tensor_queue)
         self._running = False
+
+    @staticmethod
+    def _slot_pool(config: TrainConfig) -> queue.Queue:
+        """The pool of pinned slots, full; pinned only when the learner is on a GPU."""
+        pin_memory = torch.device(config.learner_device).type == "cuda"
+        pool: queue.Queue = queue.Queue(maxsize=config.pinned_slots)
+        for _ in range(config.pinned_slots):
+            pool.put(PinnedSlot(config.learner_batch_size, config.max_new_tokens, config.reward_max_tokens, pin_memory))
+        return pool
 
     def run(self) -> None:
         """Start the reward model, then the pipeline; stop once enough transitions are stored."""
@@ -172,8 +236,7 @@ class RLManager:
             self._stages.stop(self._JOIN_ORDER)
 
     def _write_summary(self) -> None:
-        """The buffer's stats row and the run's totals."""
-        self._telemetry.log_buffer_stats(self._telemetry.update_count, self._buffer.get_priority_stats())
+        """The run's totals."""
         self._telemetry.write_counters({
             "transitions_pushed": self._telemetry.transitions_pushed,
             "actor_batches": self._telemetry.actor_batches,

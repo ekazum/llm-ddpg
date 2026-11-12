@@ -39,6 +39,17 @@ class TrainConfig(YamlConfig):
     per_beta_start: float = Field(ge=0.0, le=1.0)
     per_n_anneal: int = Field(ge=1)
     per_priority_floor: float = Field(gt=0.0)
+    # Device the learner trains on.
+    learner_device: str
+    # Rows per learner batch, and rows stored before the first draw.
+    learner_batch_size: int = Field(ge=1)
+    min_buffer_size: int = Field(ge=1)
+    # Batches drawn per hold of the buffer lock, drawn batches queued ahead, and pinned slots in the pool.
+    block_batches: int = Field(ge=1)
+    prefetch_depth: int = Field(ge=1)
+    pinned_slots: int = Field(ge=1)
+    # Learner updates between two buffer stats rows.
+    stats_every_updates: int = Field(ge=1)
     # Transitions the actor writes before the job stops.
     max_actor_transitions: int = Field(ge=1)
     # Transitions written per learner update at most; 0 turns the limit off.

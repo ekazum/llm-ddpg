@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=llm-ddpg-train
-#SBATCH --partition=shaham-L40
+#SBATCH --partition=p_a100_shaham
+#SBATCH --account=ug_shaham
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G

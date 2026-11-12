@@ -42,8 +42,12 @@ class TokenPolicyModel:
         new_tokens = self._new_tokens(prompts, max_new_tokens, temperature).cpu()
         counts: list[int] = (new_tokens != self.pad_token_id).sum(dim=1).tolist()
         ids: list[list[int]] = [row[:count].tolist() for row, count in zip(new_tokens, counts)]
+        return list(zip(ids, self.decode(ids)))
+
+    def decode(self, ids: list[list[int]]) -> list[str]:
+        """The text of each response, special tokens dropped; safe to call from any thread."""
         texts: list[str] = self._tokenizer.batch_decode(ids, skip_special_tokens=True)
-        return [(row_ids, text.strip()) for row_ids, text in zip(ids, texts)]
+        return [text.strip() for text in texts]
 
     def _new_tokens(self, prompts: list[str], max_new_tokens: int, temperature: float) -> torch.Tensor:
         """The generated tokens of each prompt under the chat template, padded on the right."""
