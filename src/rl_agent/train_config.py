@@ -12,8 +12,10 @@ class TrainConfig(YamlConfig):
     # Policy (the actor) and reward model, as Hugging Face ids or local directories.
     policy_model: str
     reward_model: str
-    # Devices the two models are loaded on.
-    policy_device: str
+    # One actor copy per device, each with its own generation worker; copy i trains with learner rank i, so its device
+    # is learner_devices[i]. Two or more average their gradients.
+    actor_devices: list[str] = Field(min_length=1)
+    # Device the reward model is loaded on.
     reward_device: str
     # Chat template arguments of the policy; the same as in config/prompts.yaml.
     chat_template_kwargs: dict[str, Any]

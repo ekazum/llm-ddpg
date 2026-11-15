@@ -1,10 +1,10 @@
 """``RLManager`` — the training job: builds every part and queue, runs the threads, stops them in order.
 
-Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWorker``, rewards from
-``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
+Actor side: ``ActorFeeder`` -> one ``ActorProcessor`` per actor copy (responses from that copy's ``ActorGPUWorker``,
+rewards from ``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
 ``LearnerProcessor`` -> one ``LearnerGPUWorker`` per learner device (critic updates on an equal share of each draw,
-gradients averaged through a ``GradientExchange`` when there are two or more; rank 0 also steps the actor, which
-``ActorGPUWorker`` keeps generating from) ->
+gradients averaged through a ``GradientExchange`` when there are two or more; rank i also steps actor copy i, when
+there is one, with a second exchange between the actor copies) ->
 ``PriorityUpdater`` and ``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once
 the rank 0 learner has done ``max_updates``. Evaluation: each actor snapshot is scored on dev by ``LLMSelectTask``
 on its own stage, drained after the pipeline stops; then ``LLMTestTask`` scores the best one on test. The reward
@@ -15,6 +15,7 @@ import copy
 import logging
 import queue
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -95,12 +96,14 @@ class RLManager:
     def __init__(
         self,
         config: TrainConfig,
-        policy: Optional[TokenPolicyModel] = None,
+        policies: Optional[list[TokenPolicyModel]] = None,
         reward_model: Optional[SequenceRewardModel] = None,
         critic_tokenizer: Optional[RewardModelTokenizer] = None,
         eval_policy: Optional[TokenPolicyModel] = None,
     ) -> None:
         """Check the inputs, load the models, open the run record, build the parts and wire the stages."""
+        logger.info("RLManager: config %s", config.model_dump())
+        loading = time.perf_counter()
         self._config = config
         self._check_run_length(config)
         self._check_devices(config)
@@ -119,9 +122,11 @@ class RLManager:
             config.reward_batch_chars,
             name=self._RM_STAGE,
         )
-        policy = policy or TokenPolicyModel(
-            config.policy_model, config.policy_device, config.chat_template_kwargs, trainable=True)
-        actor_optimizer = torch.optim.AdamW(policy.parameters(), lr=config.actor_lr)
+        # Each copy loaded from the same weights, so all start equal.
+        policies = policies or [
+            TokenPolicyModel(config.policy_model, device, config.chat_template_kwargs, trainable=True)
+            for device in config.actor_devices]
+        actor_optimizers = [torch.optim.AdamW(policy.parameters(), lr=config.actor_lr) for policy in policies]
         eval_policy = eval_policy or TokenPolicyModel(
             config.policy_model, config.eval_device, config.chat_template_kwargs)
         # Its own instance: a tokenizer must not be called from two threads at once.
@@ -131,8 +136,11 @@ class RLManager:
         self._shutdown_event = threading.Event()
         exchange = (GradientExchange(critics, self._shutdown_event, check_every=config.stats_every_updates)
                     if len(critics) > 1 else None)
+        actor_exchange = (GradientExchange([policy.module for policy in policies], self._shutdown_event,
+                                           check_every=config.stats_every_updates)
+                          if len(policies) > 1 else None)
         batch_queue: queue.Queue = queue.Queue(maxsize=self._BATCH_QUEUE_SIZE)
-        sample_queue: queue.Queue = queue.Queue()
+        sample_queues: list[queue.Queue] = [queue.Queue() for _ in policies]
         write_queue: queue.Queue = queue.Queue(maxsize=self._WRITE_QUEUE_SIZE)
         stats_queue: queue.Queue = queue.Queue(maxsize=self._STATS_QUEUE_SIZE)
         prefetch_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
@@ -140,17 +148,22 @@ class RLManager:
         priority_queue: queue.Queue = queue.Queue(maxsize=self._PRIORITY_QUEUE_SIZE)
         checkpoint_queue: queue.Queue = queue.Queue(maxsize=self._CHECKPOINT_QUEUE_SIZE)
         slot_pool = self._slot_pool(config)
-        actor_worker = ActorGPUWorker(
-            SamplingModel(policy, config.max_new_tokens, config.temperature),
-            sample_queue,
-            self._shutdown_event,
-            config.generate_batch_size,
-            config.generate_idle_timeout_s,
-            config.generate_batch_size,
-            name=self._ACTOR_GPU_STAGE,
-        )
+        actor_workers = [
+            ActorGPUWorker(
+                SamplingModel(policy, config.max_new_tokens, config.temperature),
+                sample_queue,
+                self._shutdown_event,
+                config.generate_batch_size,
+                config.generate_idle_timeout_s,
+                config.generate_batch_size,
+                name=f"{self._ACTOR_GPU_STAGE}-{rank}",
+            )
+            for rank, (policy, sample_queue) in enumerate(zip(policies, sample_queues))
+        ]
 
-        # Opened once both models have loaded, so a run directory exists only for a job that got this far.
+        logger.info("RLManager: %d actor copies, %d critic copies and the eval policy loaded in %.0f s",
+                    len(policies), len(critics), time.perf_counter() - loading)
+        # Opened once the models have loaded, so a run directory exists only for a job that got this far.
         self._record = RunRecord(config.records_dir, self.KIND, config.policy_model)
         self._telemetry = Telemetry(StatsStore(self._record.directory))
         self._buffer = PrioritizedReplayBuffer(
@@ -164,17 +177,21 @@ class RLManager:
             stats_q=stats_queue,
         )
         writer = ReplayWriter(self._buffer, write_queue, self._telemetry, self._shutdown_event)
-        processor = ActorProcessor(
-            self._sampler,
-            batch_queue,
-            sample_queue,
-            RewardModelClient(reward_queue, self._rm_shutdown_event),
-            write_queue,
-            self._telemetry,
-            config.max_new_tokens,
-            policy.pad_token_id,
-            self._shutdown_event,
-        )
+        # One processor per actor copy, so each copy's generation worker has a batch of its own in flight.
+        processors = [
+            ActorProcessor(
+                self._sampler,
+                batch_queue,
+                sample_queue,
+                RewardModelClient(reward_queue, self._rm_shutdown_event),
+                write_queue,
+                self._telemetry,
+                config.max_new_tokens,
+                policies[0].pad_token_id,
+                self._shutdown_event,
+            )
+            for sample_queue in sample_queues
+        ]
         feeder = ActorFeeder(
             self._sampler,
             batch_queue,
@@ -223,13 +240,14 @@ class RLManager:
                 push_per_update_ratio=config.push_per_update_ratio,
                 exchange=exchange,
                 rank=rank,
-                policy=policy if rank == 0 else None,
-                actor_optimizer=actor_optimizer if rank == 0 else None,
+                policy=policies[rank] if rank < len(policies) else None,
+                actor_optimizer=actor_optimizers[rank] if rank < len(policies) else None,
                 actor_lr_init=config.actor_lr,
                 actor_lr_min=config.actor_lr_min,
                 actor_every=config.actor_every,
                 actor_start_update=config.actor_start_update,
                 actor_micro_batch=config.actor_micro_batch,
+                actor_exchange=actor_exchange if rank < len(policies) else None,
             )
             for rank, (critic, tensor_queue) in enumerate(zip(critics, tensor_queues))
         ]
@@ -280,9 +298,9 @@ class RLManager:
                            sentinel_after=learner_stages[-1])
         self._stages.stage(self._CHECKPOINT_STAGE, checkpoint_writer.run, inbox=checkpoint_queue,
                            sentinel_after=learner_stages[-1])
-        self._stages.stage(self._ACTOR_GPU_STAGE, actor_worker.run)
+        self._stages.stage(self._ACTOR_GPU_STAGE, [worker.run for worker in actor_workers])
         self._stages.stage(self._WRITER_STAGE, writer.run, inbox=write_queue)
-        self._stages.stage(self._PROCESSOR_STAGE, processor.run, inbox=batch_queue)
+        self._stages.stage(self._PROCESSOR_STAGE, [processor.run for processor in processors], inbox=batch_queue)
         self._stages.stage(self._FEEDER_STAGE, feeder.run)
         self._stages.stage(self._READER_STAGE, reader.run)
         self._stages.stage(self._LEARNER_PROCESSOR_STAGE, learner_processor.run, inbox=prefetch_queue)
@@ -310,7 +328,10 @@ class RLManager:
 
     @staticmethod
     def _check_devices(config: TrainConfig) -> None:
-        """Raise when a device does not exist, or the batch or slot pool does not split over the learner devices."""
+        """Raise on a missing device, a batch or slot pool that does not split, or misplaced actor copies.
+
+        The batch and the slot pool split over the learner devices; actor copy i is on learner device i.
+        """
         devices = len(config.learner_devices)
         if len(set(config.learner_devices)) != devices:
             raise ValueError(f"RLManager: learner_devices repeats a device: {config.learner_devices}")
@@ -319,10 +340,13 @@ class RLManager:
                              f"{devices} learner devices")
         if config.pinned_slots < devices:
             raise ValueError(f"RLManager: pinned_slots={config.pinned_slots} is below the {devices} learner devices")
-        if torch.device(config.policy_device) != torch.device(config.learner_devices[0]):
-            raise ValueError(f"RLManager: the actor step runs on the first learner device "
-                             f"{config.learner_devices[0]}; policy_device is {config.policy_device}")
-        for name in [config.policy_device, config.reward_device, config.eval_device, *config.learner_devices]:
+        actors = [torch.device(name) for name in config.actor_devices]
+        learners = [torch.device(name) for name in config.learner_devices]
+        if len(actors) > len(learners) or actors != learners[:len(actors)]:
+            raise ValueError(f"RLManager: actor copy i trains with learner rank i, so actor_devices "
+                             f"{config.actor_devices} must be the first entries of learner_devices "
+                             f"{config.learner_devices}")
+        for name in [config.reward_device, config.eval_device, *config.learner_devices]:
             device = torch.device(name)
             if device.type == "cuda" and (device.index or 0) >= torch.cuda.device_count():
                 raise ValueError(f"RLManager: device {name} does not exist; {torch.cuda.device_count()} GPUs visible")
@@ -366,11 +390,18 @@ class RLManager:
             self._eval_running = True
             self._stages.start()
             self._running = True
+            started = time.perf_counter()
             self._wait_done()
             self._stop_pipeline()
+            trained = time.perf_counter()
+            logger.info("RLManager: training took %.0f s; scoring the snapshots still queued", trained - started)
             self._stop_eval()
+            drained = time.perf_counter()
+            logger.info("RLManager: dev scoring drained in %.0f s; test pass", drained - trained)
             self._write_summary()
             self._test.run()
+            logger.info("RLManager: test pass took %.0f s; %.0f s in all", time.perf_counter() - drained,
+                        time.perf_counter() - started)
             status = "done"
         finally:
             self._finish(status)

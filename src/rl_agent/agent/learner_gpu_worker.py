@@ -7,7 +7,7 @@ an episode of T token steps with reward 0 until the last; with γ = 1 the TD tar
     y_k = v'_{k+1}  (target critic), k < T        y_T = r
     loss = Σ_rows w · mean_k (v_k − y_k)² / B      priority = mean_k |v_k − y_k|
 
-The actor step (rank 0, once due) climbs the critic on the same batch. Each chosen token a_k enters the critic as a
+The actor step (ranks with an actor copy, once due) climbs the critic on the same batch. Each chosen token a_k enters the critic as a
 straight-through embedding, so the forward pass reads the stored tokens and the gradient reaches the actor::
 
     e_k = Eᵀ (onehot(a_k) + p_k − sg(p_k)),  p_k = π(· | s_k)     actor loss = −Σ_rows w · mean_{k ≥ 1} v_k / B
@@ -22,6 +22,7 @@ import logging
 import math
 import queue
 import threading
+import time
 
 import torch
 from rl_core.critic_step import CriticStep
@@ -78,17 +79,20 @@ class LearnerGPUWorker(DDPGLearner):
         actor_every: int = 1,
         actor_start_update: int = 0,
         actor_micro_batch: int = 1,
+        actor_exchange: GradientExchange | None = None,
     ) -> None:
         """Bind the critic pair, the queues, the slot pool and the cadences; ``rank`` 0 has the write queue.
 
-        ``policy`` and ``actor_optimizer`` (rank 0 only) turn the actor step on; the policy must be on this device.
+        ``policy`` and ``actor_optimizer`` turn the actor step on; the policy must be on this device.
+        ``actor_exchange`` averages its gradients with the other actor copies.
         """
         super().__init__(
             critic, critic_target, optimizer, tensor_queue, priority_queue, write_queue, telemetry, shutdown_event,
             tau=tau, lr_init=lr_init, lr_min=lr_min, max_updates=max_updates,
             checkpoint_every=checkpoint_every, push_per_update_ratio=push_per_update_ratio,
             exchange=exchange, rank=rank, actor_optimizer=actor_optimizer, actor_lr_init=actor_lr_init,
-            actor_lr_min=actor_lr_min, actor_every=actor_every, actor_start_update=actor_start_update)
+            actor_lr_min=actor_lr_min, actor_every=actor_every, actor_start_update=actor_start_update,
+            actor_exchange=actor_exchange)
         self._critic_model = critic
         self._policy = policy
         self._slot_pool = slot_pool
@@ -101,9 +105,13 @@ class LearnerGPUWorker(DDPGLearner):
         self._on_device: QBatch | None = None
         self._sums: dict[str, float] = {}
         self._counts: dict[str, int] = {}
+        # When this update's step began, and when the previous one ended (None before the first).
+        self._step_started = 0.0
+        self._last_step_end: float | None = None
 
     def _critic_backward(self, batch: LearnerBatch) -> CriticStep:
         """The per-token TD loss of the batch, backward a micro-batch at a time."""
+        self._step_started = time.perf_counter()
         q = self._to_device(batch)
         self._on_device = q
         n = q.num_rows
@@ -247,27 +255,51 @@ class LearnerGPUWorker(DDPGLearner):
         return {name: tensor.detach().to("cpu", dtype=torch.bfloat16).clone() for name, tensor in weights.items()}
 
     def _on_step(self, update: int, metrics: dict[str, float]) -> None:
-        """Rank 0: sum the step's diagnostics; every ``stats_every_updates`` updates, write and log their averages."""
+        """Rank 0: sum the step's diagnostics; every ``stats_every_updates`` updates, write and log their averages.
+
+        Timing: ``step_seconds`` is the update's own work (critic and actor steps, exchanges included);
+        ``update_seconds`` is the time from the previous update's end, so the gap between them is time spent
+        waiting for batches or for the actor side. ``gpu<i>_peak_gb`` is each GPU's peak since the last row.
+        """
         if not self.primary:
             return
+        now = time.perf_counter()
+        metrics = {**metrics, "step_seconds": now - self._step_started}
+        if self._last_step_end is not None:
+            metrics["update_seconds"] = now - self._last_step_end
+        self._last_step_end = now
         for name, value in metrics.items():
             self._sums[name] = self._sums.get(name, 0.0) + value
             self._counts[name] = self._counts.get(name, 0) + 1
         if update % self._stats_every_updates != 0:
             return
         means = {name: value / self._counts[name] for name, value in self._sums.items()}
+        # NaN is stored as NULL, in a column typed from the first row's floats.
+        means.setdefault("update_seconds", math.nan)
         if self._policy is not None:
-            # NaN is stored as NULL, in a column typed from the first row's floats.
             for name in self._ACTOR_METRICS:
                 means.setdefault(name, math.nan)
+        peaks = self._gpu_peaks()
+        means.update({f"gpu{index}_peak_gb": peak for index, peak in enumerate(peaks)})
         self._sums, self._counts = {}, {}
         self._diag.log_learner_diag(update, means)
         logger.info(
-            "LearnerGPUWorker: update %d, loss %.4f, |td| %.4f, |v_T - r| %.4f, v0 %.3f, reward %.3f, "
-            "%.0f values per row, grad norm %.3f, lr %.2e%s",
-            update, means["loss"], means["td_abs"], means["end_abs_error"], means["v0"], means["reward"],
-            means["values_per_row"], means["grad_norm"], means["lr"], self._actor_line(means))
+            "LearnerGPUWorker: update %d/%d, loss %.4f, |td| %.4f, |v_T - r| %.4f, v0 %.3f, reward %.3f, "
+            "%.0f values per row, grad norm %.3f, lr %.2e%s; %.2f s per update, %.2f s of it stepping%s",
+            update, self._max_updates, means["loss"], means["td_abs"], means["end_abs_error"], means["v0"],
+            means["reward"], means["values_per_row"], means["grad_norm"], means["lr"], self._actor_line(means),
+            means["update_seconds"], means["step_seconds"],
+            "; GPU peak GB " + ", ".join(f"{index}: {peak:.1f}" for index, peak in enumerate(peaks)) if peaks else "")
         self._request_stats(update)
+
+    @staticmethod
+    def _gpu_peaks() -> list[float]:
+        """Each visible GPU's peak allocated memory, in GB, since the last call; the peaks are then reset."""
+        peaks: list[float] = []
+        for index in range(torch.cuda.device_count()):
+            peaks.append(torch.cuda.max_memory_allocated(index) / 1e9)
+            torch.cuda.reset_peak_memory_stats(index)
+        return peaks
 
     @staticmethod
     def _actor_line(means: dict[str, float]) -> str:

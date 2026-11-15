@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import shutil
+import time
 from pathlib import Path
 
 import torch
@@ -41,8 +42,10 @@ class RunSnapshotStore:
     def write_snapshot(self, update: int, q_online_state_dict: dict, dims: dict) -> Path:
         """Write the critic (and the actor, when given) at ``update``; return the critic file's path."""
         path = self._critic_path(update)
+        started = time.perf_counter()
         self._save({"update": update, "state_dict": q_online_state_dict[self.CRITIC], "dims": dims}, path)
-        logger.info("RunSnapshotStore: %s, %.2f GB", path.name, path.stat().st_size / 1e9)
+        logger.info("RunSnapshotStore: %s, %.2f GB in %.0f s", path.name, path.stat().st_size / 1e9,
+                    time.perf_counter() - started)
         if self.ACTOR in q_online_state_dict:
             self._write_actor(update, q_online_state_dict[self.ACTOR])
         return path
@@ -51,10 +54,13 @@ class RunSnapshotStore:
         """The actor directory of ``update``, then its ``(update, directory)`` on the snapshot queue."""
         directory = self.actor_path(update)
         partial = directory.with_name(directory.name + ".partial")
+        started = time.perf_counter()
         shutil.rmtree(partial, ignore_errors=True)
         self._saver.save(partial, state_dict)
         os.replace(partial, directory)
-        logger.info("RunSnapshotStore: %s written", directory.name)
+        size = sum(file.stat().st_size for file in directory.iterdir())
+        logger.info("RunSnapshotStore: %s, %.2f GB in %.0f s", directory.name, size / 1e9,
+                    time.perf_counter() - started)
         self._snapshot_queue.put((update, directory))
 
     def write_latest(self, state: CheckpointState) -> None:

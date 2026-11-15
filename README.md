@@ -55,7 +55,7 @@ continues from the first missing output.
 
 Phase 2 is the baseline job: the untrained policy scored by the frozen reward model on dev and on test, after a check
 that the reward model prefers the `chosen` reply of each dev pair. It needs rl-core in the environment
-(`pip install "rl-core @ git+https://github.com/ekazum/rl-core.git@v0.11.0"`, which also installs torch) and one GPU.
+(`pip install "rl-core @ git+https://github.com/ekazum/rl-core.git@v0.12.0"`, which also installs torch) and one GPU.
 
 ```bash
 bash scripts/download_models.sh       # once, from a node with internet access

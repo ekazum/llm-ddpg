@@ -1,6 +1,7 @@
 """``TokenPolicyModel`` — the chat policy: one user turn in, one generated response out."""
 
 import logging
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -35,6 +36,11 @@ class TokenPolicyModel:
         logger.info("TokenPolicyModel: %s on %s, %s", model_name, self._device,
                     "trainable (float32)" if trainable else "frozen (bfloat16)")
 
+    @property
+    def module(self) -> nn.Module:
+        """The model itself, for a gradient exchange between actor copies."""
+        return self._model
+
     def parameters(self) -> Iterator[nn.Parameter]:
         """The model's weights, for the actor's optimizer."""
         return self._model.parameters()
@@ -50,11 +56,12 @@ class TokenPolicyModel:
 
     def load_weights(self, directory: Path) -> None:
         """Load the weights of a model directory written by ``save`` into this model, in its own dtype."""
+        started = time.perf_counter()
         # The auto class's stub has no return type; it builds a PreTrainedModel.
         loaded: PreTrainedModel = cast(Any, AutoModelForCausalLM).from_pretrained(
             directory, dtype=self._model.dtype)
         self._model.load_state_dict(loaded.state_dict())
-        logger.info("TokenPolicyModel: weights loaded from %s", directory)
+        logger.info("TokenPolicyModel: weights loaded from %s in %.0f s", directory, time.perf_counter() - started)
 
     def logits_at(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor, positions: torch.Tensor,
