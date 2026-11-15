@@ -27,6 +27,8 @@ class PinnedSlot:
         self.is_weights = self._tensor((batch_size,), torch.float32)
         self.input_ids = self._tensor((batch_size, max_input_tokens), torch.int64)
         self.attention_mask = self._tensor((batch_size, max_input_tokens), torch.int64)
+        self.prompt_end = self._tensor((batch_size,), torch.int64)
+        self.value_len = self._tensor((batch_size,), torch.int64)
 
     def replay_views(self) -> dict[str, np.ndarray]:
         """Numpy views of the replay columns, named as in ``TrajectoryCodec``."""

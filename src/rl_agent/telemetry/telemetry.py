@@ -54,6 +54,10 @@ class Telemetry:
         """Write one ``buffer`` row; ``episode_index`` is the learner update count it is keyed by."""
         self._store.append(StatsStore.BUFFER, [{"update_count": episode_index, **metrics}], key="update_count")
 
+    def log_learner_diag(self, update_count: int, metrics: dict) -> None:
+        """Write one ``learner_diag`` row, keyed by ``update_count``."""
+        self._store.append(StatsStore.LEARNER_DIAG, [{"update_count": update_count, **metrics}], key="update_count")
+
     def write_counters(self, values: dict) -> None:
         """Upsert the run's totals."""
         self._store.set_pairs(StatsStore.COUNTERS, values)

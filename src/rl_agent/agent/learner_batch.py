@@ -20,6 +20,9 @@ class LearnerBatch:
     # (B, T) int64: the critic input, padded on the right to the longest of the batch.
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
+    # (B,) int64: index of the last token before the response, and the number of critic values (response tokens + 1).
+    prompt_end: torch.Tensor
+    value_len: torch.Tensor
     # (B,) int64 buffer rows; host only.
     indices: np.ndarray
     # The slot behind the tensors; the learner returns it to the pool.

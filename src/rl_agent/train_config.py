@@ -48,11 +48,26 @@ class TrainConfig(YamlConfig):
     block_batches: int = Field(ge=1)
     prefetch_depth: int = Field(ge=1)
     pinned_slots: int = Field(ge=1)
-    # Learner updates between two buffer stats rows.
+    # Learner updates between two buffer stats and learner_diag rows.
     stats_every_updates: int = Field(ge=1)
-    # Transitions the actor writes before the job stops.
+    # Critic learning rate, falling linearly to the minimum over max_updates.
+    critic_lr: float = Field(gt=0.0)
+    critic_lr_min: float = Field(ge=0.0)
+    # Step of the target critic toward the critic after each update, in (0, 1].
+    critic_tau: float = Field(gt=0.0, le=1.0)
+    # Largest gradient norm of a critic update.
+    grad_clip: float = Field(gt=0.0)
+    # Rows per critic forward and backward pass; a batch is processed in such pieces.
+    critic_micro_batch: int = Field(ge=1)
+    # Critic updates before the job stops.
+    max_updates: int = Field(ge=1)
+    # Updates between two critic snapshots; 0 turns snapshots off.
+    checkpoint_every: int = Field(ge=0)
+    # Keep every critic snapshot (true) or only the newest (false: the previous one is deleted).
+    keep_snapshots: bool
+    # Most transitions the actor writes.
     max_actor_transitions: int = Field(ge=1)
-    # Transitions written per learner update at most; 0 turns the limit off.
+    # Transitions stored per learner update, held by both sides; 0 turns the limit off.
     push_per_update_ratio: float = Field(ge=0.0)
     # Seed of the prompt order and of the replay draws.
     seed: int

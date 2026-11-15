@@ -58,14 +58,37 @@ block_batches: 4
 prefetch_depth: 8
 pinned_slots: 8
 
-# Learner updates between two buffer stats rows (1 or more).
-stats_every_updates: 100
+# Learner updates between two buffer stats and learner_diag rows (1 or more).
+stats_every_updates: 16
 
-# Transitions the actor writes before the job stops. A short first run.
+# Critic learning rate, falling linearly to the minimum over max_updates (above 0; minimum 0 or more).
+critic_lr: 5.0e-6
+critic_lr_min: 5.0e-7
+
+# Step of the target critic toward the critic after each update (above 0, up to 1).
+critic_tau: 0.05
+
+# Largest gradient norm of a critic update (above 0).
+grad_clip: 1.0
+
+# Rows per critic forward and backward pass (1 or more); bounds the activation memory.
+critic_micro_batch: 32
+
+# Critic updates before the job stops (1 or more); at most
+# max_actor_transitions / push_per_update_ratio when the ratio is on.
+max_updates: 512
+
+# Updates between two critic snapshots (0 = none), and whether every snapshot
+# is kept (false: only the newest; about 3.4 GB each in bfloat16).
+checkpoint_every: 128
+keep_snapshots: false
+
+# Most transitions the actor writes.
 max_actor_transitions: 2048
 
-# Transitions written per learner update at most; 0 turns the limit off.
-push_per_update_ratio: 0
+# Transitions stored per learner update, held by both the actor and the
+# learner; 0 turns the limit off.
+push_per_update_ratio: 4
 
 # Seed of the prompt order and of the replay draws.
 seed: 0

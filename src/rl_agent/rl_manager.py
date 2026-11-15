@@ -2,11 +2,12 @@
 
 Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWorker``, rewards from
 ``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
-``LearnerProcessor`` -> ``LearnerGPUWorker`` (Phase 4: no gradient step yet); ``StatsProcessor`` writes the buffer
-stats rows. The job stops once ``max_actor_transitions`` are stored. The reward model thread has its own stage,
-stopped last.
+``LearnerProcessor`` -> ``LearnerGPUWorker`` (critic updates; the actor is frozen) -> ``PriorityUpdater`` and
+``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once the learner has done
+``max_updates``. The reward model thread has its own stage, stopped last.
 """
 
+import copy
 import logging
 import queue
 import threading
@@ -16,13 +17,17 @@ import numpy as np
 import torch
 from ai_runtime import ThreadStages
 from rl_core.actor_feeder import ActorFeeder
+from rl_core.checkpoint_writer import CheckpointWriter
 from rl_core.prioritized_replay_buffer import PrioritizedReplayBuffer
+from rl_core.priority_updater import PriorityUpdater
 from rl_core.replay_reader import ReplayReader
 from rl_core.replay_writer import ReplayWriter
 from rl_core.stats_processor import StatsProcessor
 
 from src.rl_agent.agent.actor_gpu_worker import ActorGPUWorker
 from src.rl_agent.agent.actor_processor import ActorProcessor
+from src.rl_agent.agent.critic_model import CriticModel
+from src.rl_agent.agent.critic_snapshot_store import CriticSnapshotStore
 from src.rl_agent.agent.learner_gpu_worker import LearnerGPUWorker
 from src.rl_agent.agent.learner_processor import LearnerProcessor
 from src.rl_agent.agent.pinned_slot import PinnedSlot
@@ -55,16 +60,23 @@ class RLManager:
     _READER_STAGE = "replay-reader"
     _LEARNER_PROCESSOR_STAGE = "learner-processor"
     _LEARNER_STAGE = "learner"
+    _PRIORITY_STAGE = "priority-updater"
+    _CHECKPOINT_STAGE = "checkpoint-writer"
     _STATS_STAGE = "stats-processor"
     # Producers are joined before their consumers.
     _JOIN_ORDER = [_FEEDER_STAGE, _PROCESSOR_STAGE, _ACTOR_GPU_STAGE, _READER_STAGE, _LEARNER_PROCESSOR_STAGE,
-                   _LEARNER_STAGE, _WRITER_STAGE, _STATS_STAGE]
-    # Actor batches waiting for a processor, pushed batches waiting for the writer, and stats events.
+                   _LEARNER_STAGE, _PRIORITY_STAGE, _CHECKPOINT_STAGE, _WRITER_STAGE, _STATS_STAGE]
+    # Actor batches waiting for a processor, pushed batches waiting for the writer, stats events, priority
+    # updates, and snapshots waiting for the checkpoint writer (each a CPU copy of the critic).
     _BATCH_QUEUE_SIZE = 4
     _WRITE_QUEUE_SIZE = 8
     _STATS_QUEUE_SIZE = 2048
+    _PRIORITY_QUEUE_SIZE = 64
+    _CHECKPOINT_QUEUE_SIZE = 1
     # Seconds between checks of the stop condition and of the reward model's readiness.
     _POLL_S = 5.0
+    # Seconds a thread is given to exit at stop; covers a snapshot write in progress.
+    _JOIN_TIMEOUT_S = 600.0
 
     def __init__(
         self,
@@ -73,8 +85,9 @@ class RLManager:
         reward_model: Optional[SequenceRewardModel] = None,
         critic_tokenizer: Optional[RewardModelTokenizer] = None,
     ) -> None:
-        """Check the inputs, load both models, open the run record, build the parts and wire the stages."""
+        """Check the inputs, load the models, open the run record, build the parts and wire the stages."""
         self._config = config
+        self._check_run_length(config)
         PromptReader(config.prompts_dir, 0).check()
         sampler_seed, replay_seed = np.random.SeedSequence(config.seed).spawn(2)
         self._sampler = PromptSampler(config.prompts_dir, sampler_seed)
@@ -93,6 +106,9 @@ class RLManager:
         policy = policy or TokenPolicyModel(config.policy_model, config.policy_device, config.chat_template_kwargs)
         # Its own instance: a tokenizer must not be called from two threads at once.
         critic_tokenizer = critic_tokenizer or RewardModelTokenizer(config.reward_model, config.reward_max_tokens)
+        critic = CriticModel(config.reward_model, config.learner_device)
+        critic_target = copy.deepcopy(critic).requires_grad_(False)
+        optimizer = torch.optim.AdamW(critic.parameters(), lr=config.critic_lr)
 
         self._shutdown_event = threading.Event()
         batch_queue: queue.Queue = queue.Queue(maxsize=self._BATCH_QUEUE_SIZE)
@@ -101,6 +117,8 @@ class RLManager:
         stats_queue: queue.Queue = queue.Queue(maxsize=self._STATS_QUEUE_SIZE)
         prefetch_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
         tensor_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
+        priority_queue: queue.Queue = queue.Queue(maxsize=self._PRIORITY_QUEUE_SIZE)
+        checkpoint_queue: queue.Queue = queue.Queue(maxsize=self._CHECKPOINT_QUEUE_SIZE)
         slot_pool = self._slot_pool(config)
         actor_worker = ActorGPUWorker(
             SamplingModel(policy, config.max_new_tokens, config.temperature),
@@ -157,37 +175,70 @@ class RLManager:
         learner_processor = LearnerProcessor(
             self._buffer,
             self._sampler,
-            policy,
             critic_tokenizer,
             prefetch_queue,
             tensor_queue,
             slot_pool,
             self._shutdown_event,
         )
-        learner = LearnerGPUWorker(
+        self._learner = LearnerGPUWorker(
+            critic,
+            critic_target,
+            optimizer,
             tensor_queue,
             slot_pool,
+            priority_queue,
+            checkpoint_queue,
             stats_queue,
             self._telemetry,
-            config.learner_device,
-            config.stats_every_updates,
             self._shutdown_event,
+            micro_batch=config.critic_micro_batch,
+            stats_every_updates=config.stats_every_updates,
+            tau=config.critic_tau,
+            lr_init=config.critic_lr,
+            lr_min=config.critic_lr_min,
+            max_updates=config.max_updates,
+            grad_clip=config.grad_clip,
+            checkpoint_every=config.checkpoint_every,
+            push_per_update_ratio=config.push_per_update_ratio,
+        )
+        priority_updater = PriorityUpdater(self._buffer, priority_queue, self._shutdown_event)
+        checkpoint_writer = CheckpointWriter(
+            checkpoint_queue,
+            stats_queue,
+            CriticSnapshotStore(self._record.directory),
+            self._shutdown_event,
+            keep_all=config.keep_snapshots,
         )
         stats = StatsProcessor(stats_queue, self._buffer, self._telemetry, config.replay_capacity, self._shutdown_event)
 
         self._rm_stages = ThreadStages("RLManager.rm", self._rm_shutdown_event)
         self._rm_stages.stage(self._RM_STAGE, self._rm_worker.run)
         # Stages start in the order added: services before producers.
-        self._stages = ThreadStages("RLManager", self._shutdown_event)
-        self._stages.stage(self._STATS_STAGE, stats.run, inbox=stats_queue, sentinel_after=self._LEARNER_STAGE)
+        self._stages = ThreadStages("RLManager", self._shutdown_event, join_timeout=self._JOIN_TIMEOUT_S)
+        # The checkpoint writer also puts stats events, so the stats processor is woken after it.
+        self._stages.stage(self._STATS_STAGE, stats.run, inbox=stats_queue, sentinel_after=self._CHECKPOINT_STAGE)
+        self._stages.stage(self._PRIORITY_STAGE, priority_updater.run, inbox=priority_queue,
+                           sentinel_after=self._LEARNER_STAGE)
+        self._stages.stage(self._CHECKPOINT_STAGE, checkpoint_writer.run, inbox=checkpoint_queue,
+                           sentinel_after=self._LEARNER_STAGE)
         self._stages.stage(self._ACTOR_GPU_STAGE, actor_worker.run)
         self._stages.stage(self._WRITER_STAGE, writer.run, inbox=write_queue)
         self._stages.stage(self._PROCESSOR_STAGE, processor.run, inbox=batch_queue)
         self._stages.stage(self._FEEDER_STAGE, feeder.run)
         self._stages.stage(self._READER_STAGE, reader.run)
         self._stages.stage(self._LEARNER_PROCESSOR_STAGE, learner_processor.run, inbox=prefetch_queue)
-        self._stages.stage(self._LEARNER_STAGE, learner.run, inbox=tensor_queue)
+        self._stages.stage(self._LEARNER_STAGE, self._learner.run, inbox=tensor_queue)
         self._running = False
+
+    @staticmethod
+    def _check_run_length(config: TrainConfig) -> None:
+        """Raise when the push ratio would hold the learner back before ``max_updates``."""
+        ratio = config.push_per_update_ratio
+        if ratio > 0 and config.max_updates * ratio > config.max_actor_transitions:
+            raise ValueError(
+                f"RLManager: max_updates={config.max_updates} needs {config.max_updates * ratio:.0f} transitions at "
+                f"push_per_update_ratio={ratio}; max_actor_transitions is {config.max_actor_transitions}")
 
     @staticmethod
     def _slot_pool(config: TrainConfig) -> queue.Queue:
@@ -199,7 +250,7 @@ class RLManager:
         return pool
 
     def run(self) -> None:
-        """Start the reward model, then the pipeline; stop once enough transitions are stored."""
+        """Start the reward model, then the pipeline; stop once the learner has finished."""
         logger.info("RLManager: run %s in %s", self._record.run_id, self._record.directory)
         status = "failed"
         self._rm_stages.start()
@@ -222,10 +273,10 @@ class RLManager:
                 raise RuntimeError("RLManager: the reward model thread stopped before it was ready")
 
     def _wait_done(self) -> None:
-        """Return once ``max_actor_transitions`` are stored, or once a thread sets the shutdown event."""
+        """Return once the learner has finished (its final snapshot queued), or once a thread sets the shutdown event."""
         while not self._shutdown_event.wait(self._POLL_S):
-            if self._telemetry.transitions_pushed >= self._config.max_actor_transitions:
-                logger.info("RLManager: %d transitions stored; stopping", self._telemetry.transitions_pushed)
+            if self._learner.done.is_set():
+                logger.info("RLManager: learner finished at update %d; stopping", self._telemetry.update_count)
                 return
         logger.info("RLManager: shutdown event set by a thread; stopping")
 

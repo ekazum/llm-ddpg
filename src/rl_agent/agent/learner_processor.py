@@ -1,8 +1,7 @@
 """``LearnerProcessor`` — a drawn batch from the replay buffer to a ``LearnerBatch`` in a pinned slot.
 
-Per draw: the rows are gathered into a free slot (one copy, under the buffer's shared lock), the responses are
-decoded, each (prompt, response) is formatted and tokenized as the reward model reads it, and the batch goes on the
-tensor queue. Several processors can drain the same prefetch queue; batch order does not matter.
+Per draw: the rows are gathered into a free slot (one copy, under the buffer's shared lock), each response's own
+token ids are placed in the reward model's template after its prompt, and the batch goes on the tensor queue. Several processors can drain the same prefetch queue; batch order does not matter.
 """
 
 import logging
@@ -17,7 +16,6 @@ from src.rl_agent.agent.learner_batch import LearnerBatch
 from src.rl_agent.agent.pinned_slot import PinnedSlot
 from src.rl_agent.agent.prompt_sampler import PromptSampler
 from src.rl_agent.reward_model_tokenizer import RewardModelTokenizer
-from src.rl_agent.token_policy_model import TokenPolicyModel
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +31,15 @@ class LearnerProcessor:
         self,
         replay_buffer: PrioritizedReplayBuffer,
         sampler: PromptSampler,
-        policy: TokenPolicyModel,
         critic_tokenizer: RewardModelTokenizer,
         prefetch_queue: queue.Queue,
         tensor_queue: queue.Queue,
         slot_pool: queue.Queue,
         shutdown_event: threading.Event,
     ) -> None:
-        """Bind the buffer, the prompt table, the two tokenizers, the two queues and the slot pool."""
+        """Bind the buffer, the prompt table, the critic's tokenizer, the two queues and the slot pool."""
         self._buffer = replay_buffer
         self._sampler = sampler
-        self._policy = policy
         self._critic_tokenizer = critic_tokenizer
         self._prefetch_queue = prefetch_queue
         self._tensor_queue = tensor_queue
@@ -75,22 +71,26 @@ class LearnerProcessor:
         logger.info("LearnerProcessor: exiting, %d batches converted", converted)
 
     def _convert(self, indices: np.ndarray, is_weights: np.ndarray, slot: PinnedSlot) -> LearnerBatch:
-        """Gather the rows into ``slot`` and add the critic input of each."""
+        """Gather the rows into ``slot`` and add the critic input of each, built from the stored token ids."""
         self._buffer.gather_into(indices, slot.replay_views())
         np.copyto(slot.is_weights.numpy(), is_weights)
         lengths: list[int] = slot.response_len.tolist()
         ids: list[list[int]] = [row[:length].tolist() for row, length in zip(slot.response_ids, lengths)]
         prompts = self._sampler.prompts(slot.prompt_row.tolist())
-        input_ids, attention_mask = self._critic_tokenizer.encode(prompts, self._policy.decode(ids))
+        input_ids, attention_mask, prompt_end, value_len = self._critic_tokenizer.encode_ids(prompts, ids)
         width = int(input_ids.shape[1])
         slot.input_ids[:, :width].copy_(input_ids)
         slot.attention_mask[:, :width].copy_(attention_mask)
+        slot.prompt_end.copy_(prompt_end)
+        slot.value_len.copy_(value_len)
         return LearnerBatch(
             reward=slot.reward,
             done=slot.done,
             is_weights=slot.is_weights,
             input_ids=slot.input_ids[:, :width],
             attention_mask=slot.attention_mask[:, :width],
+            prompt_end=slot.prompt_end,
+            value_len=slot.value_len,
             indices=indices,
             slot=slot,
         )
