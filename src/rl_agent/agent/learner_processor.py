@@ -84,12 +84,13 @@ class LearnerProcessor:
         lengths: list[int] = slot.response_len.tolist()
         ids: list[list[int]] = [row[:length].tolist() for row, length in zip(slot.response_ids, lengths)]
         prompts = self._sampler.prompts(slot.prompt_row.tolist())
-        input_ids, attention_mask, prompt_end, value_len = self._critic_tokenizer.encode_ids(prompts, ids)
+        input_ids, attention_mask, prompt_end, value_len, action_len = self._critic_tokenizer.encode_ids(prompts, ids)
         width = int(input_ids.shape[1])
         slot.input_ids[:, :width].copy_(input_ids)
         slot.attention_mask[:, :width].copy_(attention_mask)
         slot.prompt_end.copy_(prompt_end)
         slot.value_len.copy_(value_len)
+        slot.action_len.copy_(action_len)
         return LearnerBatch(
             reward=slot.reward,
             done=slot.done,
@@ -98,6 +99,7 @@ class LearnerProcessor:
             attention_mask=slot.attention_mask[:, :width],
             prompt_end=slot.prompt_end,
             value_len=slot.value_len,
+            action_len=slot.action_len,
             indices=indices,
             slot=slot,
         )

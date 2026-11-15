@@ -72,11 +72,22 @@ critic_lr_min: 5.0e-7
 # Step of the target critic toward the critic after each update (above 0, up to 1).
 critic_tau: 0.05
 
-# Largest gradient norm of a critic update (above 0).
-grad_clip: 1.0
-
 # Rows per critic forward and backward pass (1 or more); bounds the activation memory.
 critic_micro_batch: 32
+
+# Actor learning rate, falling linearly to the minimum over max_updates (above 0;
+# minimum 0 or more). Starting guesses, not tuned.
+actor_lr: 1.0e-6
+actor_lr_min: 1.0e-7
+
+# Critic updates before the first actor step (0 or more; max_updates or more
+# keeps the actor frozen), and critic updates per actor step after it (1 or more).
+actor_start_update: 128
+actor_every: 1
+
+# Rows per actor forward and backward pass (1 or more); bounds the
+# rows x tokens x vocabulary probabilities in memory. A guess, not measured.
+actor_micro_batch: 4
 
 # Critic updates before the job stops (1 or more); at most
 # max_actor_transitions / push_per_update_ratio when the ratio is on.

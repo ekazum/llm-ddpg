@@ -29,9 +29,25 @@ class CriticModel(nn.Module):
         self.train()
         logger.info("CriticModel: %s on %s", model_name, device)
 
+    @property
+    def embedding_weight(self) -> torch.Tensor:
+        """``(vocab, hidden)``: the input embedding table."""
+        # The input embeddings of a Qwen3 model are an nn.Embedding; the stub returns a plain nn.Module.
+        embedding = cast(nn.Embedding, self._model.get_input_embeddings())
+        return embedding.weight
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """``(B, T)`` float32: the value after each token of the input."""
         hidden = self._model.base_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        return self._score(hidden)
+
+    def values_from_embeddings(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """``(B, T)`` float32: the value after each position, from input embeddings instead of token ids."""
+        hidden = self._model.base_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+        return self._score(hidden)
+
+    def _score(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The score head on every hidden state."""
         # The score head is the sequence classifier's own linear layer; the model stub does not declare it.
         values: torch.Tensor = cast(Any, self._model).score(hidden)
         return values.squeeze(-1).float()

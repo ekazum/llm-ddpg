@@ -43,23 +43,27 @@ class RewardModelTokenizer:
 
     def encode_ids(
         self, prompts: list[str], response_ids: list[list[int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The critic input from the policy's own response tokens: the template's text, then the ids, then its end.
 
-        Returns ``(input_ids, attention_mask, prompt_end, value_len)``: ``(n, longest)`` int64 padded on the right,
-        the index of the last token before the response, and the number of critic values (response tokens + 1).
-        A trailing end-of-turn id is dropped, since the template's end adds it back. Needs the policy's vocabulary.
+        Returns ``(input_ids, attention_mask, prompt_end, value_len, action_len)``: ``(n, longest)`` int64 padded on
+        the right, the index of the last token before the response, the number of critic values (response tokens
+        + 1), and the tokens the policy chose (+ 1 when it ended the turn). A trailing end-of-turn id is dropped,
+        since the template's end adds it back at the same place. Needs the policy's vocabulary.
         """
         prefixes = self._token_ids([self._split(prompt)[0] for prompt in prompts])
         eos = self._tokenizer.eos_token_id
         rows: list[list[int]] = []
         prompt_end: list[int] = []
         value_len: list[int] = []
+        action_len: list[int] = []
         for prefix, ids in zip(prefixes, response_ids):
-            body = ids[:-1] if ids and ids[-1] == eos else ids
+            ended = bool(ids) and ids[-1] == eos
+            body = ids[:-1] if ended else ids
             rows.append(prefix + body + self._tail_ids)
             prompt_end.append(len(prefix) - 1)
             value_len.append(len(body) + 1)
+            action_len.append(len(body) + int(ended))
         longest = max(len(row) for row in rows)
         if longest > self._max_tokens:
             raise ValueError(f"RewardModelTokenizer: a critic input has {longest} tokens; the limit is "
@@ -70,7 +74,7 @@ class RewardModelTokenizer:
             input_ids[i, :len(row)] = torch.tensor(row, dtype=torch.int64)
             attention_mask[i, :len(row)] = 1
         return (input_ids, attention_mask, torch.tensor(prompt_end, dtype=torch.int64),
-                torch.tensor(value_len, dtype=torch.int64))
+                torch.tensor(value_len, dtype=torch.int64), torch.tensor(action_len, dtype=torch.int64))
 
     def _split(self, prompt: str) -> tuple[str, str]:
         """The pair's template text before and after the response."""

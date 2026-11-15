@@ -56,10 +56,16 @@ class TrainConfig(YamlConfig):
     critic_lr_min: float = Field(ge=0.0)
     # Step of the target critic toward the critic after each update, in (0, 1].
     critic_tau: float = Field(gt=0.0, le=1.0)
-    # Largest gradient norm of a critic update.
-    grad_clip: float = Field(gt=0.0)
     # Rows per critic forward and backward pass; a batch is processed in such pieces.
     critic_micro_batch: int = Field(ge=1)
+    # Actor learning rate, falling linearly to the minimum over max_updates.
+    actor_lr: float = Field(gt=0.0)
+    actor_lr_min: float = Field(ge=0.0)
+    # Critic updates before the first actor step, and critic updates per actor step after it.
+    actor_start_update: int = Field(ge=0)
+    actor_every: int = Field(ge=1)
+    # Rows per actor forward and backward pass; bounds the (rows, tokens, vocab) probabilities in memory.
+    actor_micro_batch: int = Field(ge=1)
     # Critic updates before the job stops.
     max_updates: int = Field(ge=1)
     # Updates between two critic snapshots; 0 turns snapshots off.

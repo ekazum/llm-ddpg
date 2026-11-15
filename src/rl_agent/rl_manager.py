@@ -3,7 +3,8 @@
 Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWorker``, rewards from
 ``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
 ``LearnerProcessor`` -> one ``LearnerGPUWorker`` per learner device (critic updates on an equal share of each draw,
-gradients averaged through a ``GradientExchange`` when there are two or more; the actor is frozen) ->
+gradients averaged through a ``GradientExchange`` when there are two or more; rank 0 also steps the actor, which
+``ActorGPUWorker`` keeps generating from) ->
 ``PriorityUpdater`` and ``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once
 the rank 0 learner has done ``max_updates``. The reward model thread has its own stage, stopped last.
 """
@@ -17,7 +18,6 @@ from typing import Optional
 import numpy as np
 import torch
 from ai_runtime import ThreadStages
-from torch import nn
 from rl_core.actor_feeder import ActorFeeder
 from rl_core.checkpoint_writer import CheckpointWriter
 from rl_core.gradient_exchange import GradientExchange
@@ -107,7 +107,9 @@ class RLManager:
             config.reward_batch_chars,
             name=self._RM_STAGE,
         )
-        policy = policy or TokenPolicyModel(config.policy_model, config.policy_device, config.chat_template_kwargs)
+        policy = policy or TokenPolicyModel(
+            config.policy_model, config.policy_device, config.chat_template_kwargs, trainable=True)
+        actor_optimizer = torch.optim.AdamW(policy.parameters(), lr=config.actor_lr)
         # Its own instance: a tokenizer must not be called from two threads at once.
         critic_tokenizer = critic_tokenizer or RewardModelTokenizer(config.reward_model, config.reward_max_tokens)
         critics = self._critics(config)
@@ -203,11 +205,17 @@ class RLManager:
                 lr_init=config.critic_lr,
                 lr_min=config.critic_lr_min,
                 max_updates=config.max_updates,
-                grad_clip=config.grad_clip,
                 checkpoint_every=config.checkpoint_every,
                 push_per_update_ratio=config.push_per_update_ratio,
                 exchange=exchange,
                 rank=rank,
+                policy=policy if rank == 0 else None,
+                actor_optimizer=actor_optimizer if rank == 0 else None,
+                actor_lr_init=config.actor_lr,
+                actor_lr_min=config.actor_lr_min,
+                actor_every=config.actor_every,
+                actor_start_update=config.actor_start_update,
+                actor_micro_batch=config.actor_micro_batch,
             )
             for rank, (critic, tensor_queue) in enumerate(zip(critics, tensor_queues))
         ]
@@ -264,16 +272,19 @@ class RLManager:
                              f"{devices} learner devices")
         if config.pinned_slots < devices:
             raise ValueError(f"RLManager: pinned_slots={config.pinned_slots} is below the {devices} learner devices")
+        if torch.device(config.policy_device) != torch.device(config.learner_devices[0]):
+            raise ValueError(f"RLManager: the actor step runs on the first learner device "
+                             f"{config.learner_devices[0]}; policy_device is {config.policy_device}")
         for name in [config.policy_device, config.reward_device, *config.learner_devices]:
             device = torch.device(name)
             if device.type == "cuda" and (device.index or 0) >= torch.cuda.device_count():
                 raise ValueError(f"RLManager: device {name} does not exist; {torch.cuda.device_count()} GPUs visible")
 
     @staticmethod
-    def _critics(config: TrainConfig) -> list[nn.Module]:
+    def _critics(config: TrainConfig) -> list[CriticModel]:
         """One critic per learner device: loaded on the first, copied to the others, so all start equal."""
         first = CriticModel(config.reward_model, config.learner_devices[0])
-        critics: list[nn.Module] = [first]
+        critics: list[CriticModel] = [first]
         for device in config.learner_devices[1:]:
             critics.append(copy.deepcopy(first).to(torch.device(device)))
             logger.info("RLManager: critic copied to %s", device)

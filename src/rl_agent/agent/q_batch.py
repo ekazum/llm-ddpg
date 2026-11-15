@@ -19,6 +19,8 @@ class QBatch:
     # (B,) int64: index of the last token before the response, and the number of critic values.
     prompt_end: torch.Tensor
     value_len: torch.Tensor
+    # (B,) int64: response tokens the policy chose, its end of turn included.
+    action_len: torch.Tensor
     # (B,) int64 buffer rows.
     indices: np.ndarray
 

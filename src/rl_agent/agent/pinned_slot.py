@@ -29,6 +29,7 @@ class PinnedSlot:
         self.attention_mask = self._tensor((batch_size, max_input_tokens), torch.int64)
         self.prompt_end = self._tensor((batch_size,), torch.int64)
         self.value_len = self._tensor((batch_size,), torch.int64)
+        self.action_len = self._tensor((batch_size,), torch.int64)
 
     def replay_views(self) -> dict[str, np.ndarray]:
         """Numpy views of the replay columns, named as in ``TrajectoryCodec``."""
