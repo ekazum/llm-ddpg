@@ -2,9 +2,10 @@
 
 Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWorker``, rewards from
 ``RewardModelWorker``) -> ``ReplayWriter`` -> ``PrioritizedReplayBuffer``. Learner side: ``ReplayReader`` ->
-``LearnerProcessor`` -> ``LearnerGPUWorker`` (critic updates; the actor is frozen) -> ``PriorityUpdater`` and
-``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once the learner has done
-``max_updates``. The reward model thread has its own stage, stopped last.
+``LearnerProcessor`` -> one ``LearnerGPUWorker`` per learner device (critic updates on an equal share of each draw,
+gradients averaged through a ``GradientExchange`` when there are two or more; the actor is frozen) ->
+``PriorityUpdater`` and ``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once
+the rank 0 learner has done ``max_updates``. The reward model thread has its own stage, stopped last.
 """
 
 import copy
@@ -16,8 +17,10 @@ from typing import Optional
 import numpy as np
 import torch
 from ai_runtime import ThreadStages
+from torch import nn
 from rl_core.actor_feeder import ActorFeeder
 from rl_core.checkpoint_writer import CheckpointWriter
+from rl_core.gradient_exchange import GradientExchange
 from rl_core.prioritized_replay_buffer import PrioritizedReplayBuffer
 from rl_core.priority_updater import PriorityUpdater
 from rl_core.replay_reader import ReplayReader
@@ -63,9 +66,9 @@ class RLManager:
     _PRIORITY_STAGE = "priority-updater"
     _CHECKPOINT_STAGE = "checkpoint-writer"
     _STATS_STAGE = "stats-processor"
-    # Producers are joined before their consumers.
-    _JOIN_ORDER = [_FEEDER_STAGE, _PROCESSOR_STAGE, _ACTOR_GPU_STAGE, _READER_STAGE, _LEARNER_PROCESSOR_STAGE,
-                   _LEARNER_STAGE, _PRIORITY_STAGE, _CHECKPOINT_STAGE, _WRITER_STAGE, _STATS_STAGE]
+    # Producers are joined before their consumers; the learner stages (one per device) go after the processor.
+    _JOIN_HEAD = [_FEEDER_STAGE, _PROCESSOR_STAGE, _ACTOR_GPU_STAGE, _READER_STAGE, _LEARNER_PROCESSOR_STAGE]
+    _JOIN_TAIL = [_PRIORITY_STAGE, _CHECKPOINT_STAGE, _WRITER_STAGE, _STATS_STAGE]
     # Actor batches waiting for a processor, pushed batches waiting for the writer, stats events, priority
     # updates, and snapshots waiting for the checkpoint writer (each a CPU copy of the critic).
     _BATCH_QUEUE_SIZE = 4
@@ -88,6 +91,7 @@ class RLManager:
         """Check the inputs, load the models, open the run record, build the parts and wire the stages."""
         self._config = config
         self._check_run_length(config)
+        self._check_devices(config)
         PromptReader(config.prompts_dir, 0).check()
         sampler_seed, replay_seed = np.random.SeedSequence(config.seed).spawn(2)
         self._sampler = PromptSampler(config.prompts_dir, sampler_seed)
@@ -106,17 +110,17 @@ class RLManager:
         policy = policy or TokenPolicyModel(config.policy_model, config.policy_device, config.chat_template_kwargs)
         # Its own instance: a tokenizer must not be called from two threads at once.
         critic_tokenizer = critic_tokenizer or RewardModelTokenizer(config.reward_model, config.reward_max_tokens)
-        critic = CriticModel(config.reward_model, config.learner_device)
-        critic_target = copy.deepcopy(critic).requires_grad_(False)
-        optimizer = torch.optim.AdamW(critic.parameters(), lr=config.critic_lr)
+        critics = self._critics(config)
 
         self._shutdown_event = threading.Event()
+        exchange = (GradientExchange(critics, self._shutdown_event, check_every=config.stats_every_updates)
+                    if len(critics) > 1 else None)
         batch_queue: queue.Queue = queue.Queue(maxsize=self._BATCH_QUEUE_SIZE)
         sample_queue: queue.Queue = queue.Queue()
         write_queue: queue.Queue = queue.Queue(maxsize=self._WRITE_QUEUE_SIZE)
         stats_queue: queue.Queue = queue.Queue(maxsize=self._STATS_QUEUE_SIZE)
         prefetch_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
-        tensor_queue: queue.Queue = queue.Queue(maxsize=config.prefetch_depth)
+        tensor_queues: list[queue.Queue] = [queue.Queue(maxsize=config.prefetch_depth) for _ in critics]
         priority_queue: queue.Queue = queue.Queue(maxsize=self._PRIORITY_QUEUE_SIZE)
         checkpoint_queue: queue.Queue = queue.Queue(maxsize=self._CHECKPOINT_QUEUE_SIZE)
         slot_pool = self._slot_pool(config)
@@ -177,31 +181,39 @@ class RLManager:
             self._sampler,
             critic_tokenizer,
             prefetch_queue,
-            tensor_queue,
+            tensor_queues,
             slot_pool,
             self._shutdown_event,
         )
-        self._learner = LearnerGPUWorker(
-            critic,
-            critic_target,
-            optimizer,
-            tensor_queue,
-            slot_pool,
-            priority_queue,
-            checkpoint_queue,
-            stats_queue,
-            self._telemetry,
-            self._shutdown_event,
-            micro_batch=config.critic_micro_batch,
-            stats_every_updates=config.stats_every_updates,
-            tau=config.critic_tau,
-            lr_init=config.critic_lr,
-            lr_min=config.critic_lr_min,
-            max_updates=config.max_updates,
-            grad_clip=config.grad_clip,
-            checkpoint_every=config.checkpoint_every,
-            push_per_update_ratio=config.push_per_update_ratio,
-        )
+        learners = [
+            LearnerGPUWorker(
+                critic,
+                copy.deepcopy(critic).requires_grad_(False),
+                torch.optim.AdamW(critic.parameters(), lr=config.critic_lr),
+                tensor_queue,
+                slot_pool,
+                priority_queue,
+                checkpoint_queue if rank == 0 else None,
+                stats_queue,
+                self._telemetry,
+                self._shutdown_event,
+                micro_batch=config.critic_micro_batch,
+                stats_every_updates=config.stats_every_updates,
+                tau=config.critic_tau,
+                lr_init=config.critic_lr,
+                lr_min=config.critic_lr_min,
+                max_updates=config.max_updates,
+                grad_clip=config.grad_clip,
+                checkpoint_every=config.checkpoint_every,
+                push_per_update_ratio=config.push_per_update_ratio,
+                exchange=exchange,
+                rank=rank,
+            )
+            for rank, (critic, tensor_queue) in enumerate(zip(critics, tensor_queues))
+        ]
+        self._learner = learners[0]
+        learner_stages = [self._learner_stage(rank) for rank in range(len(learners))]
+        self._join_order = self._JOIN_HEAD + learner_stages + self._JOIN_TAIL
         priority_updater = PriorityUpdater(self._buffer, priority_queue, self._shutdown_event)
         checkpoint_writer = CheckpointWriter(
             checkpoint_queue,
@@ -219,16 +231,17 @@ class RLManager:
         # The checkpoint writer also puts stats events, so the stats processor is woken after it.
         self._stages.stage(self._STATS_STAGE, stats.run, inbox=stats_queue, sentinel_after=self._CHECKPOINT_STAGE)
         self._stages.stage(self._PRIORITY_STAGE, priority_updater.run, inbox=priority_queue,
-                           sentinel_after=self._LEARNER_STAGE)
+                           sentinel_after=learner_stages[-1])
         self._stages.stage(self._CHECKPOINT_STAGE, checkpoint_writer.run, inbox=checkpoint_queue,
-                           sentinel_after=self._LEARNER_STAGE)
+                           sentinel_after=learner_stages[-1])
         self._stages.stage(self._ACTOR_GPU_STAGE, actor_worker.run)
         self._stages.stage(self._WRITER_STAGE, writer.run, inbox=write_queue)
         self._stages.stage(self._PROCESSOR_STAGE, processor.run, inbox=batch_queue)
         self._stages.stage(self._FEEDER_STAGE, feeder.run)
         self._stages.stage(self._READER_STAGE, reader.run)
         self._stages.stage(self._LEARNER_PROCESSOR_STAGE, learner_processor.run, inbox=prefetch_queue)
-        self._stages.stage(self._LEARNER_STAGE, self._learner.run, inbox=tensor_queue)
+        for name, learner, tensor_queue in zip(learner_stages, learners, tensor_queues):
+            self._stages.stage(name, learner.run, inbox=tensor_queue)
         self._running = False
 
     @staticmethod
@@ -241,12 +254,43 @@ class RLManager:
                 f"push_per_update_ratio={ratio}; max_actor_transitions is {config.max_actor_transitions}")
 
     @staticmethod
+    def _check_devices(config: TrainConfig) -> None:
+        """Raise when a device does not exist, or the batch or slot pool does not split over the learner devices."""
+        devices = len(config.learner_devices)
+        if len(set(config.learner_devices)) != devices:
+            raise ValueError(f"RLManager: learner_devices repeats a device: {config.learner_devices}")
+        if config.learner_batch_size % devices != 0:
+            raise ValueError(f"RLManager: learner_batch_size={config.learner_batch_size} does not split over "
+                             f"{devices} learner devices")
+        if config.pinned_slots < devices:
+            raise ValueError(f"RLManager: pinned_slots={config.pinned_slots} is below the {devices} learner devices")
+        for name in [config.policy_device, config.reward_device, *config.learner_devices]:
+            device = torch.device(name)
+            if device.type == "cuda" and (device.index or 0) >= torch.cuda.device_count():
+                raise ValueError(f"RLManager: device {name} does not exist; {torch.cuda.device_count()} GPUs visible")
+
+    @staticmethod
+    def _critics(config: TrainConfig) -> list[nn.Module]:
+        """One critic per learner device: loaded on the first, copied to the others, so all start equal."""
+        first = CriticModel(config.reward_model, config.learner_devices[0])
+        critics: list[nn.Module] = [first]
+        for device in config.learner_devices[1:]:
+            critics.append(copy.deepcopy(first).to(torch.device(device)))
+            logger.info("RLManager: critic copied to %s", device)
+        return critics
+
+    def _learner_stage(self, rank: int) -> str:
+        """Stage name of the learner of ``rank``."""
+        return self._LEARNER_STAGE if rank == 0 else f"{self._LEARNER_STAGE}-{rank}"
+
+    @staticmethod
     def _slot_pool(config: TrainConfig) -> queue.Queue:
-        """The pool of pinned slots, full; pinned only when the learner is on a GPU."""
-        pin_memory = torch.device(config.learner_device).type == "cuda"
+        """The pool of slots, full, each one device's share of a batch; pinned when a learner is on a GPU."""
+        pin_memory = any(torch.device(name).type == "cuda" for name in config.learner_devices)
+        rows = config.learner_batch_size // len(config.learner_devices)
         pool: queue.Queue = queue.Queue(maxsize=config.pinned_slots)
         for _ in range(config.pinned_slots):
-            pool.put(PinnedSlot(config.learner_batch_size, config.max_new_tokens, config.reward_max_tokens, pin_memory))
+            pool.put(PinnedSlot(rows, config.max_new_tokens, config.reward_max_tokens, pin_memory))
         return pool
 
     def run(self) -> None:
@@ -284,7 +328,7 @@ class RLManager:
         """Stop the pipeline once; a thread's exception is re-raised here."""
         if self._running:
             self._running = False
-            self._stages.stop(self._JOIN_ORDER)
+            self._stages.stop(self._join_order)
 
     def _write_summary(self) -> None:
         """The run's totals."""

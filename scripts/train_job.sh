@@ -7,9 +7,9 @@
 #SBATCH --mem=64G
 #SBATCH --output=logs/train_%j.log
 set -euo pipefail
-# Training job (Phase 3: sampling and reward loop, no learning). Submitted by
+# Training job (critic training, actor frozen). Submitted by
 # scripts/submit_train.sh from the repo root; the first argument is the
-# training config.
+# training config. One GPU here; submit_train.sh --gpus 2 asks for two.
 
 CONFIG=${1:-config/train.yaml}
 CONDA_ENV=${CONDA_ENV:-/private/shaham-lab/ekazum/envs/llm-ddpg}

@@ -39,8 +39,9 @@ class TrainConfig(YamlConfig):
     per_beta_start: float = Field(ge=0.0, le=1.0)
     per_n_anneal: int = Field(ge=1)
     per_priority_floor: float = Field(gt=0.0)
-    # Device the learner trains on.
-    learner_device: str
+    # Devices the critic trains on, one copy each; with two or more, each takes an equal share of every batch and
+    # the copies average their gradients.
+    learner_devices: list[str] = Field(min_length=1)
     # Rows per learner batch, and rows stored before the first draw.
     learner_batch_size: int = Field(ge=1)
     min_buffer_size: int = Field(ge=1)

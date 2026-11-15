@@ -1,7 +1,8 @@
 """``LearnerProcessor`` — a drawn batch from the replay buffer to a ``LearnerBatch`` in a pinned slot.
 
-Per draw: the rows are gathered into a free slot (one copy, under the buffer's shared lock), each response's own
-token ids are placed in the reward model's template after its prompt, and the batch goes on the tensor queue. Several processors can drain the same prefetch queue; batch order does not matter.
+Per draw: the rows are split into one equal share per tensor queue (one per learner device); each share is gathered
+into a free slot (one copy, under the buffer's shared lock), each response's own token ids are placed in the reward
+model's template after its prompt, and the share goes on its queue. Shares of one draw are put in queue order.
 """
 
 import logging
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class LearnerProcessor:
-    """Processor thread: prefetch queue in, tensor queue out."""
+    """Processor thread: prefetch queue in, one share of each draw out on each tensor queue."""
 
     # Queue poll and bounded-put retry interval; bounds shutdown latency.
     _QUEUE_POLL_TIMEOUT: float = 0.1
@@ -33,16 +34,16 @@ class LearnerProcessor:
         sampler: PromptSampler,
         critic_tokenizer: RewardModelTokenizer,
         prefetch_queue: queue.Queue,
-        tensor_queue: queue.Queue,
+        tensor_queues: list[queue.Queue],
         slot_pool: queue.Queue,
         shutdown_event: threading.Event,
     ) -> None:
-        """Bind the buffer, the prompt table, the critic's tokenizer, the two queues and the slot pool."""
+        """Bind the buffer, the prompt table, the critic's tokenizer, the queues and the slot pool."""
         self._buffer = replay_buffer
         self._sampler = sampler
         self._critic_tokenizer = critic_tokenizer
         self._prefetch_queue = prefetch_queue
-        self._tensor_queue = tensor_queue
+        self._tensor_queues = tensor_queues
         self._slot_pool = slot_pool
         self._shutdown_event = shutdown_event
 
@@ -58,17 +59,23 @@ class LearnerProcessor:
                     continue
                 if item is SHUTDOWN_SENTINEL:
                     break
-                slot = self._take_slot()
-                if slot is None:
-                    break
-                indices, is_weights = item
-                if not self._put(self._convert(indices, is_weights, slot)):
+                if not self._split(*item):
                     break
                 converted += 1
         except Exception:
             self._shutdown_event.set()
             raise
         logger.info("LearnerProcessor: exiting, %d batches converted", converted)
+
+    def _split(self, indices: np.ndarray, is_weights: np.ndarray) -> bool:
+        """One equal share of the draw per tensor queue; False on shutdown."""
+        shares = len(self._tensor_queues)
+        for tensor_queue, rows, weights in zip(
+                self._tensor_queues, np.split(indices, shares), np.split(is_weights, shares)):
+            slot = self._take_slot()
+            if slot is None or not self._put(tensor_queue, self._convert(rows, weights, slot)):
+                return False
+        return True
 
     def _convert(self, indices: np.ndarray, is_weights: np.ndarray, slot: PinnedSlot) -> LearnerBatch:
         """Gather the rows into ``slot`` and add the critic input of each, built from the stored token ids."""
@@ -104,11 +111,11 @@ class LearnerProcessor:
                 continue
         return None
 
-    def _put(self, batch: LearnerBatch) -> bool:
-        """Bounded put on the tensor queue that observes shutdown; False on shutdown."""
+    def _put(self, tensor_queue: queue.Queue, batch: LearnerBatch) -> bool:
+        """Bounded put on a tensor queue that observes shutdown; False on shutdown."""
         while not self._shutdown_event.is_set():
             try:
-                self._tensor_queue.put(batch, timeout=self._QUEUE_PUT_TIMEOUT)
+                tensor_queue.put(batch, timeout=self._QUEUE_PUT_TIMEOUT)
                 return True
             except queue.Full:
                 continue

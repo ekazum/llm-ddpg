@@ -8,7 +8,9 @@ an episode of T token steps with reward 0 until the last; with γ = 1 the TD tar
     loss = Σ_rows w · mean_k (v_k − y_k)² / B      priority = mean_k |v_k − y_k|
 
 The batch is processed ``micro_batch`` rows at a time, gradients accumulated. Every ``stats_every_updates`` updates:
-a ``learner_diag`` row (averages since the last one) and a ``CheckpointEvent`` for a buffer stats row.
+a ``learner_diag`` row (averages since the last one) and a ``CheckpointEvent`` for a buffer stats row. With one
+worker per device, each takes its share of every draw and averages gradients through the ``GradientExchange``; only
+rank 0 writes the diagnostics (of its own share) and the snapshots.
 """
 
 import logging
@@ -19,6 +21,7 @@ import torch
 from rl_core.critic_step import CriticStep
 from rl_core.ddpg_learner import DDPGLearner
 from rl_core.events.checkpoint_event import CheckpointEvent
+from rl_core.gradient_exchange import GradientExchange
 from torch import nn
 
 from src.rl_agent.agent.learner_batch import LearnerBatch
@@ -42,7 +45,7 @@ class LearnerGPUWorker(DDPGLearner):
         tensor_queue: queue.Queue,
         slot_pool: queue.Queue,
         priority_queue: queue.Queue,
-        write_queue: queue.Queue,
+        write_queue: queue.Queue | None,
         stats_queue: queue.Queue,
         telemetry: Telemetry,
         shutdown_event: threading.Event,
@@ -56,12 +59,15 @@ class LearnerGPUWorker(DDPGLearner):
         grad_clip: float,
         checkpoint_every: int,
         push_per_update_ratio: float,
+        exchange: GradientExchange | None = None,
+        rank: int = 0,
     ) -> None:
-        """Bind the critic pair, the queues, the slot pool and the cadences."""
+        """Bind the critic pair, the queues, the slot pool and the cadences; ``rank`` 0 has the write queue."""
         super().__init__(
             critic, critic_target, optimizer, tensor_queue, priority_queue, write_queue, telemetry, shutdown_event,
             tau=tau, lr_init=lr_init, lr_min=lr_min, max_updates=max_updates, grad_clip=grad_clip,
-            checkpoint_every=checkpoint_every, push_per_update_ratio=push_per_update_ratio)
+            checkpoint_every=checkpoint_every, push_per_update_ratio=push_per_update_ratio,
+            exchange=exchange, rank=rank)
         self._slot_pool = slot_pool
         self._stats_queue = stats_queue
         self._diag = telemetry
@@ -156,7 +162,9 @@ class LearnerGPUWorker(DDPGLearner):
                 for name, tensor in self._critic.state_dict().items()}
 
     def _on_step(self, update: int, metrics: dict[str, float]) -> None:
-        """Sum the step's diagnostics; every ``stats_every_updates`` updates, write and log their averages."""
+        """Rank 0: sum the step's diagnostics; every ``stats_every_updates`` updates, write and log their averages."""
+        if not self.primary:
+            return
         for name, value in metrics.items():
             self._sums[name] = self._sums.get(name, 0.0) + value
         self._steps_summed += 1
