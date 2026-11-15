@@ -7,6 +7,7 @@ the thread. One run directory under ``records_dir`` holds ``eval.db``, the two r
 import logging
 import queue
 import threading
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -77,8 +78,10 @@ class BaselineManager:
             policy = self._policy or TokenPolicyModel(
                 self._config.policy_model, self._config.policy_device, self._config.chat_template_kwargs)
             score = LLMScoreTask(
-                self._config, policy, self._client, self._store, self._prompts, self._record.directory)
-            score.run("dev")
+                policy, self._client, self._store, self._prompts, self._record.directory,
+                batch_size=self._config.batch_size, max_new_tokens=self._config.max_new_tokens,
+                temperature=self._config.temperature)
+            score.run("dev", checkpoint=Path(self._config.policy_model))
             score.run("test")
             status = "done"
         finally:

@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -37,6 +38,23 @@ class TokenPolicyModel:
     def parameters(self) -> Iterator[nn.Parameter]:
         """The model's weights, for the actor's optimizer."""
         return self._model.parameters()
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """The model's weights by name, for a snapshot."""
+        return self._model.state_dict()
+
+    def save(self, directory: Path, state_dict: dict[str, torch.Tensor]) -> None:
+        """Write ``state_dict`` as a Hugging Face model directory with this model's config and tokenizer."""
+        self._model.save_pretrained(directory, state_dict=state_dict)
+        self._tokenizer.save_pretrained(directory)
+
+    def load_weights(self, directory: Path) -> None:
+        """Load the weights of a model directory written by ``save`` into this model, in its own dtype."""
+        # The auto class's stub has no return type; it builds a PreTrainedModel.
+        loaded: PreTrainedModel = cast(Any, AutoModelForCausalLM).from_pretrained(
+            directory, dtype=self._model.dtype)
+        self._model.load_state_dict(loaded.state_dict())
+        logger.info("TokenPolicyModel: weights loaded from %s", directory)
 
     def logits_at(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor, positions: torch.Tensor,

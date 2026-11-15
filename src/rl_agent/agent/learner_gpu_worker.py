@@ -33,6 +33,7 @@ from torch import nn
 from src.rl_agent.agent.critic_model import CriticModel
 from src.rl_agent.agent.learner_batch import LearnerBatch
 from src.rl_agent.agent.q_batch import QBatch
+from src.rl_agent.agent.run_snapshot_store import RunSnapshotStore
 from src.rl_agent.telemetry.telemetry import Telemetry
 from src.rl_agent.token_policy_model import TokenPolicyModel
 
@@ -234,9 +235,16 @@ class LearnerGPUWorker(DDPGLearner):
         self._slot_pool.put(batch.slot)
 
     def _snapshot_state(self) -> dict:
-        """The critic's weights as a bfloat16 CPU copy, half the size of the float32 training copy."""
-        return {name: tensor.detach().to("cpu", dtype=torch.bfloat16).clone()
-                for name, tensor in self._critic.state_dict().items()}
+        """The critic's weights, and the actor's when it trains here, as bfloat16 CPU copies."""
+        state = {RunSnapshotStore.CRITIC: self._bfloat16_copy(self._critic.state_dict())}
+        if self._policy is not None:
+            state[RunSnapshotStore.ACTOR] = self._bfloat16_copy(self._policy.state_dict())
+        return state
+
+    @staticmethod
+    def _bfloat16_copy(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """A bfloat16 CPU copy of each tensor, half the size of the float32 training copy."""
+        return {name: tensor.detach().to("cpu", dtype=torch.bfloat16).clone() for name, tensor in weights.items()}
 
     def _on_step(self, update: int, metrics: dict[str, float]) -> None:
         """Rank 0: sum the step's diagnostics; every ``stats_every_updates`` updates, write and log their averages."""

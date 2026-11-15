@@ -68,10 +68,18 @@ class TrainConfig(YamlConfig):
     actor_micro_batch: int = Field(ge=1)
     # Critic updates before the job stops.
     max_updates: int = Field(ge=1)
-    # Updates between two critic snapshots; 0 turns snapshots off.
+    # Updates between two snapshots (critic and actor); 0 turns snapshots off.
     checkpoint_every: int = Field(ge=0)
-    # Keep every critic snapshot (true) or only the newest (false: the previous one is deleted).
+    # Keep every snapshot (true), or only the best dev one and the latest (false: the others are deleted).
     keep_snapshots: bool
+    # Device of the eval policy, which scores each actor snapshot on dev and the best one on test.
+    eval_device: str
+    # Prompts generated per eval batch, and the sampling temperature of the eval passes (0 = greedy).
+    eval_batch_size: int = Field(ge=1)
+    eval_temperature: float = Field(ge=0.0)
+    # Dev prompts scored per snapshot, drawn once per run from the seed; test prompts scored (0 = every row).
+    dev_limit: int = Field(ge=0)
+    test_limit: int = Field(ge=0)
     # Most transitions the actor writes.
     max_actor_transitions: int = Field(ge=1)
     # Transitions stored per learner update, held by both sides; 0 turns the limit off.

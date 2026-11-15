@@ -93,10 +93,25 @@ actor_micro_batch: 4
 # max_actor_transitions / push_per_update_ratio when the ratio is on.
 max_updates: 512
 
-# Updates between two critic snapshots (0 = none), and whether every snapshot
-# is kept (false: only the newest; about 3.4 GB each in bfloat16).
+# Updates between two snapshots of the critic and the actor (0 = none), and
+# whether every snapshot is kept (false: only the best dev one and the latest;
+# about 3.4 GB for each model in bfloat16).
 checkpoint_every: 128
 keep_snapshots: false
+
+# Device of the eval policy (a bfloat16 copy of the actor), which scores each
+# actor snapshot on dev and the best one on test. Two GPUs: cuda:1.
+eval_device: cuda:0
+
+# Prompts generated per eval batch (1 or more), and the sampling temperature
+# of the eval passes (0 = greedy, as in the baseline job).
+eval_batch_size: 32
+eval_temperature: 0.0
+
+# Dev prompts scored per snapshot, a sample drawn once per run from the seed
+# (0 = every row), and test prompts scored (0 = every row).
+dev_limit: 256
+test_limit: 0
 
 # Most transitions the actor writes.
 max_actor_transitions: 2048

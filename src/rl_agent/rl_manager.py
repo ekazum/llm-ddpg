@@ -6,7 +6,9 @@ Actor side: ``ActorFeeder`` -> ``ActorProcessor`` (responses from ``ActorGPUWork
 gradients averaged through a ``GradientExchange`` when there are two or more; rank 0 also steps the actor, which
 ``ActorGPUWorker`` keeps generating from) ->
 ``PriorityUpdater`` and ``CheckpointWriter``; ``StatsProcessor`` writes the buffer stats rows. The job stops once
-the rank 0 learner has done ``max_updates``. The reward model thread has its own stage, stopped last.
+the rank 0 learner has done ``max_updates``. Evaluation: each actor snapshot is scored on dev by ``LLMSelectTask``
+on its own stage, drained after the pipeline stops; then ``LLMTestTask`` scores the best one on test. The reward
+model thread has its own stage, stopped last.
 """
 
 import copy
@@ -20,6 +22,7 @@ import torch
 from ai_runtime import ThreadStages
 from rl_core.actor_feeder import ActorFeeder
 from rl_core.checkpoint_writer import CheckpointWriter
+from rl_core.eval_store import EvalStore
 from rl_core.gradient_exchange import GradientExchange
 from rl_core.prioritized_replay_buffer import PrioritizedReplayBuffer
 from rl_core.priority_updater import PriorityUpdater
@@ -30,13 +33,16 @@ from rl_core.stats_processor import StatsProcessor
 from src.rl_agent.agent.actor_gpu_worker import ActorGPUWorker
 from src.rl_agent.agent.actor_processor import ActorProcessor
 from src.rl_agent.agent.critic_model import CriticModel
-from src.rl_agent.agent.critic_snapshot_store import CriticSnapshotStore
 from src.rl_agent.agent.learner_gpu_worker import LearnerGPUWorker
 from src.rl_agent.agent.learner_processor import LearnerProcessor
 from src.rl_agent.agent.pinned_slot import PinnedSlot
 from src.rl_agent.agent.prompt_sampler import PromptSampler
+from src.rl_agent.agent.run_snapshot_store import RunSnapshotStore
 from src.rl_agent.agent.sampling_model import SamplingModel
 from src.rl_agent.agent.trajectory_codec import TrajectoryCodec
+from src.rl_agent.evaluation.llm_score_task import LLMScoreTask
+from src.rl_agent.evaluation.llm_select_task import LLMSelectTask
+from src.rl_agent.evaluation.llm_test_task import LLMTestTask
 from src.rl_agent.evaluation.prompt_reader import PromptReader
 from src.rl_agent.evaluation.run_record import RunRecord
 from src.rl_agent.reward_model_client import RewardModelClient
@@ -52,10 +58,13 @@ logger = logging.getLogger(__name__)
 
 
 class RLManager:
-    """Owns the training job's parts, its queues, its two thread stage groups and their order."""
+    """Owns the training job's parts, its queues, its three thread stage groups and their order."""
 
     KIND = "train"
+    # The dev column the best snapshot is chosen by.
+    CRITERION = "mean_reward"
     _RM_STAGE = "rm-worker"
+    _SELECT_STAGE = "dev-select"
     _FEEDER_STAGE = "actor-feeder"
     _PROCESSOR_STAGE = "actor-processor"
     _ACTOR_GPU_STAGE = "actor-gpu-worker"
@@ -80,6 +89,8 @@ class RLManager:
     _POLL_S = 5.0
     # Seconds a thread is given to exit at stop; covers a snapshot write in progress.
     _JOIN_TIMEOUT_S = 600.0
+    # Seconds the dev-select thread is given to score the snapshots still queued at stop; the job's time limit.
+    _SELECT_JOIN_TIMEOUT_S = 4 * 3600.0
 
     def __init__(
         self,
@@ -87,13 +98,14 @@ class RLManager:
         policy: Optional[TokenPolicyModel] = None,
         reward_model: Optional[SequenceRewardModel] = None,
         critic_tokenizer: Optional[RewardModelTokenizer] = None,
+        eval_policy: Optional[TokenPolicyModel] = None,
     ) -> None:
         """Check the inputs, load the models, open the run record, build the parts and wire the stages."""
         self._config = config
         self._check_run_length(config)
         self._check_devices(config)
         PromptReader(config.prompts_dir, 0).check()
-        sampler_seed, replay_seed = np.random.SeedSequence(config.seed).spawn(2)
+        sampler_seed, replay_seed, dev_seed = np.random.SeedSequence(config.seed).spawn(3)
         self._sampler = PromptSampler(config.prompts_dir, sampler_seed)
 
         self._rm_shutdown_event = threading.Event()
@@ -110,6 +122,8 @@ class RLManager:
         policy = policy or TokenPolicyModel(
             config.policy_model, config.policy_device, config.chat_template_kwargs, trainable=True)
         actor_optimizer = torch.optim.AdamW(policy.parameters(), lr=config.actor_lr)
+        eval_policy = eval_policy or TokenPolicyModel(
+            config.policy_model, config.eval_device, config.chat_template_kwargs)
         # Its own instance: a tokenizer must not be called from two threads at once.
         critic_tokenizer = critic_tokenizer or RewardModelTokenizer(config.reward_model, config.reward_max_tokens)
         critics = self._critics(config)
@@ -223,17 +237,40 @@ class RLManager:
         learner_stages = [self._learner_stage(rank) for rank in range(len(learners))]
         self._join_order = self._JOIN_HEAD + learner_stages + self._JOIN_TAIL
         priority_updater = PriorityUpdater(self._buffer, priority_queue, self._shutdown_event)
+        snapshot_queue: queue.Queue = queue.Queue()
+        snapshots = RunSnapshotStore(self._record.directory, eval_policy, snapshot_queue)
+        # Retention is LLMSelectTask's, the only part that knows which snapshot is best.
         checkpoint_writer = CheckpointWriter(
-            checkpoint_queue,
-            stats_queue,
-            CriticSnapshotStore(self._record.directory),
+            checkpoint_queue, stats_queue, snapshots, self._shutdown_event, keep_all=True)
+        stats = StatsProcessor(stats_queue, self._buffer, self._telemetry, config.replay_capacity, self._shutdown_event)
+
+        eval_store = EvalStore(self._record.directory, self.CRITERION)
+        eval_client = RewardModelClient(reward_queue, self._rm_shutdown_event)
+        dev_reader = PromptReader(config.prompts_dir, config.dev_limit, int(dev_seed.generate_state(1)[0]))
+        self._eval_abort_event = threading.Event()
+        select = LLMSelectTask(
+            eval_policy,
+            self._score_task(config, eval_policy, eval_client, eval_store, dev_reader),
+            eval_store,
+            snapshots,
+            snapshot_queue,
+            self._eval_abort_event,
             self._shutdown_event,
             keep_all=config.keep_snapshots,
         )
-        stats = StatsProcessor(stats_queue, self._buffer, self._telemetry, config.replay_capacity, self._shutdown_event)
+        self._test = LLMTestTask(
+            eval_policy,
+            self._score_task(config, eval_policy, eval_client, eval_store,
+                             PromptReader(config.prompts_dir, config.test_limit)),
+            eval_store,
+        )
 
         self._rm_stages = ThreadStages("RLManager.rm", self._rm_shutdown_event)
         self._rm_stages.stage(self._RM_STAGE, self._rm_worker.run)
+        # Its own group: stopped after the pipeline, it scores the snapshots still queued before it exits.
+        self._eval_stages = ThreadStages("RLManager.eval", join_timeout=self._SELECT_JOIN_TIMEOUT_S)
+        self._eval_stages.stage(self._SELECT_STAGE, select.serve, inbox=snapshot_queue)
+        self._eval_running = False
         # Stages start in the order added: services before producers.
         self._stages = ThreadStages("RLManager", self._shutdown_event, join_timeout=self._JOIN_TIMEOUT_S)
         # The checkpoint writer also puts stats events, so the stats processor is woken after it.
@@ -251,6 +288,15 @@ class RLManager:
         for name, learner, tensor_queue in zip(learner_stages, learners, tensor_queues):
             self._stages.stage(name, learner.run, inbox=tensor_queue)
         self._running = False
+
+    def _score_task(
+        self, config: TrainConfig, policy: TokenPolicyModel, client: RewardModelClient, store: EvalStore,
+        prompts: PromptReader,
+    ) -> LLMScoreTask:
+        """A score pass of the eval policy over ``prompts``, written under the run directory."""
+        return LLMScoreTask(
+            policy, client, store, prompts, self._record.directory, batch_size=config.eval_batch_size,
+            max_new_tokens=config.max_new_tokens, temperature=config.eval_temperature)
 
     @staticmethod
     def _check_run_length(config: TrainConfig) -> None:
@@ -275,7 +321,7 @@ class RLManager:
         if torch.device(config.policy_device) != torch.device(config.learner_devices[0]):
             raise ValueError(f"RLManager: the actor step runs on the first learner device "
                              f"{config.learner_devices[0]}; policy_device is {config.policy_device}")
-        for name in [config.policy_device, config.reward_device, *config.learner_devices]:
+        for name in [config.policy_device, config.reward_device, config.eval_device, *config.learner_devices]:
             device = torch.device(name)
             if device.type == "cuda" and (device.index or 0) >= torch.cuda.device_count():
                 raise ValueError(f"RLManager: device {name} does not exist; {torch.cuda.device_count()} GPUs visible")
@@ -305,17 +351,25 @@ class RLManager:
         return pool
 
     def run(self) -> None:
-        """Start the reward model, then the pipeline; stop once the learner has finished."""
+        """Run the job: reward model, dev scoring and pipeline; at the end drain dev scoring, then test the best.
+
+        Once the learner has finished, the pipeline stops, dev scoring scores the snapshots still queued, and the
+        best dev snapshot is scored on test.
+        """
         logger.info("RLManager: run %s in %s", self._record.run_id, self._record.directory)
         status = "failed"
         self._rm_stages.start()
         try:
             self._wait_ready()
+            self._eval_stages.start()
+            self._eval_running = True
             self._stages.start()
             self._running = True
             self._wait_done()
             self._stop_pipeline()
+            self._stop_eval()
             self._write_summary()
+            self._test.run()
             status = "done"
         finally:
             self._finish(status)
@@ -341,6 +395,12 @@ class RLManager:
             self._running = False
             self._stages.stop(self._join_order)
 
+    def _stop_eval(self) -> None:
+        """Stop dev scoring once, after the snapshots queued before its sentinel; its exception is re-raised here."""
+        if self._eval_running:
+            self._eval_running = False
+            self._eval_stages.stop([self._SELECT_STAGE])
+
     def _write_summary(self) -> None:
         """The run's totals."""
         self._telemetry.write_counters({
@@ -352,11 +412,19 @@ class RLManager:
         })
 
     def _finish(self, status: str) -> None:
-        """Stop the pipeline if still running, then the reward model, then record how the run ended."""
+        """Stop the pipeline and dev scoring if still running, then the reward model, then record how the run ended.
+
+        After a failure dev scoring is aborted rather than drained.
+        """
+        if status != "done":
+            self._eval_abort_event.set()
         try:
             self._stop_pipeline()
         finally:
             try:
-                self._rm_stages.stop([self._RM_STAGE])
+                self._stop_eval()
             finally:
-                self._record.close(status)
+                try:
+                    self._rm_stages.stop([self._RM_STAGE])
+                finally:
+                    self._record.close(status)
