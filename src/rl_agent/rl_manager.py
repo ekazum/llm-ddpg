@@ -105,7 +105,7 @@ class RLManager:
         self._check_run_length(config)
         self._check_devices(config)
         PromptReader(config.prompts_dir, 0).check()
-        sampler_seed, replay_seed, dev_seed = np.random.SeedSequence(config.seed).spawn(3)
+        sampler_seed, replay_seed, dev_seed, test_seed = np.random.SeedSequence(config.seed).spawn(4)
         self._sampler = PromptSampler(config.prompts_dir, sampler_seed)
 
         self._rm_shutdown_event = threading.Event()
@@ -261,7 +261,8 @@ class RLManager:
         self._test = LLMTestTask(
             eval_policy,
             self._score_task(config, eval_policy, eval_client, eval_store,
-                             PromptReader(config.prompts_dir, config.test_limit)),
+                             PromptReader(config.prompts_dir, config.test_limit,
+                                          int(test_seed.generate_state(1)[0]))),
             eval_store,
         )
 

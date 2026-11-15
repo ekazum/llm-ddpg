@@ -84,7 +84,7 @@ class TrainConfig(YamlConfig):
     max_actor_transitions: int = Field(ge=1)
     # Transitions stored per learner update, held by both sides; 0 turns the limit off.
     push_per_update_ratio: float = Field(ge=0.0)
-    # Seed of the prompt order and of the replay draws.
+    # Seed of the prompt order, the replay draws and the dev and test samples.
     seed: int
     # Directory of the three prompts files, and the directory run records are written under.
     prompts_dir: str

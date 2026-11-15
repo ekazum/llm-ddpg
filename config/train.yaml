@@ -108,10 +108,10 @@ eval_device: cuda:0
 eval_batch_size: 32
 eval_temperature: 0.0
 
-# Dev prompts scored per snapshot, a sample drawn once per run from the seed
-# (0 = every row), and test prompts scored (0 = every row).
+# Dev prompts scored per snapshot and test prompts scored at the end, each a
+# sample drawn once per run from the seed (0 = every row).
 dev_limit: 256
-test_limit: 0
+test_limit: 256
 
 # Most transitions the actor writes.
 max_actor_transitions: 2048
@@ -120,7 +120,7 @@ max_actor_transitions: 2048
 # learner; 0 turns the limit off.
 push_per_update_ratio: 4
 
-# Seed of the prompt order and of the replay draws.
+# Seed of the prompt order, the replay draws and the dev and test samples.
 seed: 0
 
 # Directory of the three prompts files, and the directory run records go under.
