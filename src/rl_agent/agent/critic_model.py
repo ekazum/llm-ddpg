@@ -16,6 +16,9 @@ class CriticModel(nn.Module):
     Loaded in float32, so small updates are not rounded away; the forward pass runs under bfloat16 autocast.
     """
 
+    # Decoder layers that recompute their activations in the backward pass instead of storing them (the first ones).
+    _CHECKPOINT_LAYERS = 8
+
     def __init__(self, model_name: str, device: str) -> None:
         """Load the reward model's weights (one output) on ``device``, in train mode.
 
@@ -25,6 +28,10 @@ class CriticModel(nn.Module):
         # The auto class's stub has no return type; it builds a PreTrainedModel.
         self._model: PreTrainedModel = cast(Any, AutoModelForSequenceClassification).from_pretrained(
             model_name, dtype=torch.float32, num_labels=1)
+        self._model.gradient_checkpointing_enable()
+        # The decoder layers are a ModuleList the model stub does not declare.
+        for layer in cast(Any, self._model.base_model).layers[self._CHECKPOINT_LAYERS:]:
+            layer.gradient_checkpointing = False
         self.to(torch.device(device))
         self.train()
         logger.info("CriticModel: %s on %s", model_name, device)
@@ -38,12 +45,14 @@ class CriticModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """``(B, T)`` float32: the value after each token of the input."""
-        hidden = self._model.base_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        hidden = self._model.base_model(
+            input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
         return self._score(hidden)
 
     def values_from_embeddings(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """``(B, T)`` float32: the value after each position, from input embeddings instead of token ids."""
-        hidden = self._model.base_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+        hidden = self._model.base_model(
+            inputs_embeds=inputs_embeds, attention_mask=attention_mask, use_cache=False).last_hidden_state
         return self._score(hidden)
 
     def _score(self, hidden: torch.Tensor) -> torch.Tensor:

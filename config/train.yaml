@@ -78,7 +78,7 @@ critic_lr_min: 5.0e-7
 critic_tau: 0.05
 
 # Rows per critic forward and backward pass (1 or more); bounds the activation memory.
-critic_micro_batch: 32
+critic_micro_batch: 16
 
 # Actor learning rate, falling linearly to the minimum over max_updates (above 0;
 # minimum 0 or more). Starting guesses, not tuned.

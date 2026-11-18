@@ -8,6 +8,7 @@ set -euo pipefail
 #   bash scripts/submit_train.sh --config PATH         # another config
 #   bash scripts/submit_train.sh --gpus 2              # two GPUs instead of the job's one;
 #                                                      # the config's devices must use them
+#   bash scripts/submit_train.sh --partition NAME      # another partition than the job's
 #
 # The job log is logs/train_<job id>.log.
 
@@ -20,6 +21,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --config) ARGS+=("$2"); shift 2 ;;
         --gpus) SBATCH_ARGS+=("--gres=gpu:$2"); shift 2 ;;
+        --partition) SBATCH_ARGS+=("--partition=$2"); shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done

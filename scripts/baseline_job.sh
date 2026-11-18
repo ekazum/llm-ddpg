@@ -17,11 +17,13 @@ export HF_HUB_OFFLINE=1
 
 cd "$SLURM_SUBMIT_DIR"
 echo "Host: $(hostname)  Job: $SLURM_JOB_ID  Config: $CONFIG  Start: $(date)"
-# The end line is printed on every exit, with the exit code.
-trap 'echo "End: $(date)  exit=$?"' EXIT
-
 # shellcheck source=/dev/null
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
 
+# The end line carries the job's exit code, saved before anything else runs.
+set +e
 python -m src.baselines.untrained.baseline_main --config "$CONFIG"
+RC=$?
+echo "End: $(date)  exit=$RC"
+exit "$RC"
